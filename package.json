@@ -23,15 +23,16 @@
     "dev:inference": "node --watch sidecar/inference-proxy.js",
     "build:ui": "node scripts/build-ui.mjs",
     "build:ui:watch": "node scripts/build-ui.mjs --watch",
-    "build:desktop": "npm run build:ui && npm run build:cursor-core",
-    "build:cursor-core": "python scripts/build/build_cursor_core.py",
-    "check:cursor-core": "cargo check --config \"build.jobs=1\" --config \"build.incremental=false\" --manifest-path cursor-core/Cargo.toml --lib",
+    "build:desktop": "npm run check:rust && npm run build:ui && npm run build:cursor-core",
+    "check:rust": "node scripts/check-rust-toolchain.mjs",
+    "build:cursor-core": "npm run check:rust && python scripts/build/build_cursor_core.py",
+    "check:cursor-core": "npm run check:rust && cargo check --config \"build.jobs=1\" --config \"build.incremental=false\" --manifest-path cursor-core/Cargo.toml --lib",
     "check:cursor": "node scripts/check-cursor-proxy.mjs",
     "check:ui": "node scripts/check-ui.mjs",
     "tauri": "tauri",
-    "tauri:dev": "tauri dev",
-    "tauri:build": "node scripts/build/tauri_build.mjs",
-    "tauri:build:local": "node scripts/build/tauri_build.mjs --config src-tauri/tauri.local.conf.json"
+    "tauri:dev": "npm run check:rust && tauri dev",
+    "tauri:build": "npm run check:rust && node scripts/build/tauri_build.mjs",
+    "tauri:build:local": "npm run check:rust && node scripts/build/tauri_build.mjs --config src-tauri/tauri.local.conf.json"
   },
   "keywords": [
     "anybridge",

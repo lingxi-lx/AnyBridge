@@ -31,8 +31,12 @@ use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
+#[cfg(target_os = "windows")]
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+// Instant 仅用于 Windows Codex watcher 的冷却与超时计时。
+#[cfg(target_os = "windows")]
+use std::time::Instant;
 use tauri::AppHandle;
 
 #[cfg(target_os = "windows")]
@@ -41,18 +45,22 @@ use std::os::windows::process::CommandExt;
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(target_os = "windows")]
 const CDP_PORT: u16 = 9229;
 
 /// 记录当前 Codex 实际使用的 CDP 端口（可能为动态端口）。
 /// launch_with_cdp 时写入，watcher 和 injection check 读取。
 /// 0 表示尚未启动过 CDP 模式，回退到 CDP_PORT。
+#[cfg(target_os = "windows")]
 static ACTIVE_CDP_PORT: AtomicU16 = AtomicU16::new(0);
 
+#[cfg(target_os = "windows")]
 fn current_cdp_port() -> u16 {
     let p = ACTIVE_CDP_PORT.load(Ordering::Relaxed);
     if p == 0 { CDP_PORT } else { p }
 }
 
+#[cfg(target_os = "windows")]
 fn set_active_cdp_port(port: u16) {
     ACTIVE_CDP_PORT.store(port, Ordering::Relaxed);
 }
@@ -60,6 +68,7 @@ fn set_active_cdp_port(port: u16) {
 /// 找一个可用的 CDP 端口：优先 9229，被占就让 OS 分配。
 /// 解决 Codex kill 后 9229 socket 残留导致新实例 bind 失败的问题。
 /// 学 CodexPlusPlus 的 select_windows_loopback_port：靠 TcpListener::bind 检测。
+#[cfg(target_os = "windows")]
 fn select_available_cdp_port() -> u16 {
     // 先试 9229
     if std::net::TcpListener::bind(("127.0.0.1", CDP_PORT)).is_ok() {
@@ -73,6 +82,7 @@ fn select_available_cdp_port() -> u16 {
 }
 
 /// 构造 CDP 启动参数（动态端口）
+#[cfg(target_os = "windows")]
 fn cdp_launch_args(port: u16) -> String {
     format!(
         "--remote-debugging-port={port} --remote-debugging-address=127.0.0.1 --remote-allow-origins=http://127.0.0.1:{port}"
@@ -118,11 +128,6 @@ fn run_powershell(script: &str) -> Result<String, String> {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn run_powershell(_script: &str) -> Result<String, String> {
-    Err("Codex Desktop CDP 注入仅支持 Windows".to_string())
-}
-
 // ─── 原始 HTTP 探测（绕过系统代理，§4.17）──────────────────────────────
 // reqwest 在本 crate 用了 default-features=false + rustls，没有 blocking feature。
 // 这里直接用 TcpStream 发原始 HTTP，模式照搬 proxy.rs:441-460 probe_byok_stats。
@@ -132,6 +137,7 @@ fn run_powershell(_script: &str) -> Result<String, String> {
 /// CDP 的 /json 响应不主动关闭连接（keep-alive），read_to_string 会等到
 /// 超时才返回 Err。这里改成读到数据就返回：先读到第一个响应字节，再尝试
 /// 短暂继续读（40ms 内还有数据就继续拼），没有更多数据就返回已读内容。
+#[cfg(target_os = "windows")]
 fn http_get_local(port: u16, path: &str, timeout: Duration) -> Result<String, String> {
     let addrs = [
         SocketAddr::from(([127, 0, 0, 1], port)),
@@ -275,6 +281,7 @@ fn decode_chunked(body: &str) -> String {
 // ─── MSIX 检测 ────────────────────────────────────────────────────────
 
 /// MSIX 安装信息。
+#[cfg(target_os = "windows")]
 #[derive(Debug, Clone, Serialize)]
 struct CodexMsixInfo {
     /// AppUserModelId，形如 `OpenAI.Codex_2p2nqsd0c76g0!App`
@@ -325,10 +332,6 @@ $obj | ConvertTo-Json -Compress
     })
 }
 
-#[cfg(not(target_os = "windows"))]
-fn find_codex_msix() -> Result<CodexMsixInfo, String> {
-    Err("Codex Desktop CDP 注入仅支持 Windows".to_string())
-}
 
 // ─── kill ────────────────────────────────────────────────────────────
 
@@ -573,11 +576,13 @@ fn launch_plain() -> Result<u32, String> {
 // 暴露真实原因（ECONNREFUSED / No page target / patch 异常）。
 
 /// watcher 用的慢探测：给足响应时间，避免 renderer 加载中 /json 响应慢被误判为没监听。
+#[cfg(target_os = "windows")]
 fn cdp_listening_slow() -> bool {
     cdp_listening_on_port(current_cdp_port(), Duration::from_secs(2))
 }
 
 /// 探测指定端口是否在监听（动态端口用）
+#[cfg(target_os = "windows")]
 fn cdp_listening_on_port(port: u16, timeout: Duration) -> bool {
     match http_get_local(port, "/json", timeout) {
         Ok(_) => true,
@@ -909,6 +914,7 @@ pub(crate) fn clean_models_cache() -> Result<(), String> {
 // ─── 通过 sidecar 注入 CDP 补丁 ────────────────────────────────────────
 
 /// POST sidecar /__byok/codex-cdp/inject 触发 6 点补丁注入。
+#[cfg(target_os = "windows")]
 fn inject_via_sidecar() -> Result<String, String> {
     inject_via_sidecar_on_port(current_cdp_port())
 }
@@ -952,6 +958,7 @@ fn inject_via_sidecar_on_port(cdp_port: u16) -> Result<String, String> {
 }
 
 /// POST sidecar /__byok/codex-cdp/check 检测注入标记是否存在。
+#[cfg(target_os = "windows")]
 fn sidecar_injection_present() -> bool {
     let ports = configured_proxy_ports();
     let body = serde_json::json!({ "port": current_cdp_port() }).to_string();
@@ -992,11 +999,6 @@ fn codex_running() -> bool {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn codex_running() -> bool {
-    false
-}
-
 /// Desktop 相关进程是否仍在（UI 宿主 + 包内 helper）。kill 等待用。
 #[cfg(target_os = "windows")]
 fn codex_desktop_processes_present() -> bool {
@@ -1035,18 +1037,13 @@ Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {{
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-fn remaining_codex_pids() -> String {
-    String::new()
-}
-
-
 // ─── 主命令：重启 Codex Desktop ───────────────────────────────────────
 
 /// 当前 Codex 配置是否需要 CDP 注入。
 /// 读 providerStore → 找当前 codex 配置 → inject_models && !preserve_official_auth。
 /// 与前端 `needInject = !preserveAuth && injectModels !== false` 保持一致：
 /// preserveOfficialAuth=true 时 watcher 不得接管 / 补注入（保留官方登录模式）。
+#[cfg(target_os = "windows")]
 fn codex_needs_cdp_injection() -> bool {
     let store = match read_provider_store() {
         Ok(s) => s,

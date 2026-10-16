@@ -3,10 +3,14 @@ use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State};
+
+const TLS_REJECTION_RECENT_WINDOW_MS: u64 = 30 * 60 * 1000;
+// 只保留当前桌面进程内最近一次明确的 sidecar 拒绝事件，不持久化客户端信息。
+static LAST_TLS_REJECTION_AT_MS: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -27,11 +31,17 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 /// 自定义子进程包装，提供 kill 能力。
 pub struct ManagedChild {
     child: Mutex<std::process::Child>,
+    // 代理存活期间持共享锁；只有确认退出并丢弃句柄后，其他进程才能改证书包。
+    _package_lock: Option<crate::commands::system::MitmPackageLock>,
 }
 
 impl ManagedChild {
+    /// 已退出视为成功；发出终止请求后仍须确认退出，调用方才能清理状态或修改证书。
     pub fn kill(&self) -> Result<(), String> {
         let mut child = self.child.lock().unwrap_or_else(|e| e.into_inner());
+        if child.try_wait().map_err(|e| format!("检查进程状态失败: {}", e))?.is_some() {
+            return Ok(());
+        }
 
         // Windows release 模式下 sidecar 以 CREATE_NEW_PROCESS_GROUP 启动，
         // std::process::Child::kill() 只调用 TerminateProcess 杀单进程，
@@ -45,7 +55,7 @@ impl ManagedChild {
                 .creation_flags(CREATE_NO_WINDOW)
                 .output();
             match out {
-                Ok(o) if o.status.success() => return Ok(()),
+                Ok(o) if o.status.success() => return Self::wait_for_exit(&mut child),
                 Ok(o) => {
                     // taskkill 失败（进程可能已退出），尝试 TerminateProcess 兜底
                     eprintln!(
@@ -62,7 +72,26 @@ impl ManagedChild {
             }
         }
 
-        child.kill().map_err(|e| format!("停止失败: {}", e))
+        child.kill().map_err(|e| format!("停止失败: {}", e))?;
+        Self::wait_for_exit(&mut child)
+    }
+
+    // 五秒仅限制终止请求完成后的退出轮询，不包含 Windows taskkill 自身执行耗时。
+    fn wait_for_exit(child: &mut std::process::Child) -> Result<(), String> {
+        let started = Instant::now();
+        loop {
+            if child.try_wait().map_err(|e| format!("检查进程状态失败: {}", e))?.is_some() {
+                return Ok(());
+            }
+            if started.elapsed() >= Duration::from_secs(5) {
+                return Err("停止代理超时（5s），尚未确认进程退出；保留进程状态，禁止修改证书".into());
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    }
+
+    fn id(&self) -> u32 {
+        lock_or_recover(&self.child).id()
     }
 
     fn try_wait(&self) -> Result<Option<std::process::ExitStatus>, String> {
@@ -72,6 +101,40 @@ impl ManagedChild {
             .try_wait()
             .map_err(|e| format!("检查进程状态失败: {}", e))
     }
+}
+
+/// 仅在桌面管理的代理停止时执行任务；不会主动停代理，也不检测外部启动的 sidecar。
+pub(crate) fn with_proxy_stopped<T>(
+    app: &AppHandle,
+    task: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    with_proxy_stopped_state(&app.state::<ProxyState>(), task)
+}
+
+fn with_proxy_stopped_state<T>(
+    state: &ProxyState,
+    task: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    // 与启动入口共用 child 锁和 starting 标志，避免检查停止状态后又被并发启动。
+    let child = lock_or_recover(&state.child);
+    if let Some(managed) = child.as_ref() {
+        if managed.try_wait()?.is_none() {
+            return Err("请先停止代理再操作证书，避免运行中的代理继续使用旧证书".into());
+        }
+    }
+    if state.starting.swap(true, Ordering::SeqCst) {
+        return Err("代理正在启动或证书任务正在执行，请等待完成后再操作".into());
+    }
+    struct StartGuard<'a>(&'a AtomicBool);
+    impl Drop for StartGuard<'_> {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    // 任务期间只保留启动占位，不持有 child 锁；返回错误或 panic 展开时由守卫释放。
+    let _guard = StartGuard(&state.starting);
+    drop(child);
+    task()
 }
 
 #[derive(Default)]
@@ -322,11 +385,15 @@ pub fn group_report(report: &ProxyPreflightReport) -> GroupedHealthReport {
     }
 }
 
+// TLS/CONNECT 拒绝优先于箭头等成功标记，避免含恢复指引的错误行被误标为成功。
 fn classify(line: &str) -> String {
     if line.contains('❌')
         || line.contains("Error")
         || line.contains("ERROR")
         || line.contains("[ERR")
+        || line.to_ascii_lowercase().contains("tls error:")
+        || line.to_ascii_lowercase().contains("connect error")
+        || line.contains("客户端拒绝了 MITM 证书")
     {
         "err".into()
     } else if line.contains('⚠') || line.contains("Warn") || line.contains("WARN") {
@@ -335,6 +402,222 @@ fn classify(line: &str) -> String {
         "ok".into()
     } else {
         "info".into()
+    }
+}
+
+#[cfg(test)]
+mod log_classification_tests {
+    use super::{
+        classify, lock_or_recover, stop_managed_proxy,
+        with_proxy_stopped_state, ManagedChild, ProxyState,
+    };
+    use std::sync::{atomic::Ordering, Mutex};
+    #[cfg(target_os = "windows")]
+    use std::os::windows::process::CommandExt;
+
+    // 不使用 sleep，验证已过截止时间立即失败，避免依赖调度速度的测试。
+    #[test]
+    fn probe_deadline_rejects_expired_budget() {
+        let expired = std::time::Instant::now();
+        assert_eq!(super::probe_time_remaining(expired).unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        let future = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let remaining = super::probe_time_remaining(future).unwrap();
+        assert!(remaining > std::time::Duration::ZERO);
+        assert!(remaining <= std::time::Duration::from_secs(60));
+    }
+
+    // 使用内存分段模拟 TCP 分包，确保头后的 TLS 字节仍留给握手层。
+    #[test]
+    fn connect_header_handles_fragments_and_rejects_invalid_responses() {
+        use std::io::Read;
+        let mut input = (&b"HTTP/1.1 2"[..]).chain(&b"00 OK\r\nX: test\r\n\r\nTLS"[..]);
+        assert!(super::read_connect_response(&mut input).is_ok());
+        let mut remaining = String::new();
+        input.read_to_string(&mut remaining).unwrap();
+        assert_eq!(remaining, "TLS");
+        for response in ["HTTP/1.1 2000 Bad\r\n\r\n", "HTTP/1.1 407 Auth\r\n\r\n", "HTTP/1.1 200 OK\r\n"] {
+            assert!(super::read_connect_response(&mut response.as_bytes()).is_err());
+        }
+        assert!(super::read_connect_response(&mut vec![b'x'; 8193].as_slice()).is_err());
+    }
+
+    // 仅验证指纹比较，不模拟 TLS 链验证或访问系统证书库。
+    #[test]
+    fn runtime_leaf_must_match_disk_leaf() {
+        assert!(super::verify_runtime_leaf(b"same DER", b"same DER").is_ok());
+        assert!(super::verify_runtime_leaf(b"old DER", b"new DER")
+            .unwrap_err().contains("指纹不一致"));
+    }
+
+    // 即使断言失败也尝试结束测试子进程；这些测试不启动实际 sidecar 或修改信任库。
+    struct TestProxy(ProxyState);
+
+    impl Drop for TestProxy {
+        fn drop(&mut self) {
+            if let Some(child) = lock_or_recover(&self.0.child).take() {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    #[test]
+    fn proxy_stop_checks_process_identity_and_waits_before_releasing_state() {
+        let proxy = TestProxy(ProxyState::default());
+        #[cfg(target_os = "windows")]
+        let child = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", "Start-Sleep -Seconds 30"])
+            .creation_flags(super::CREATE_NO_WINDOW)
+            .spawn()
+            .expect("spawn test process");
+        #[cfg(not(target_os = "windows"))]
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn test process");
+        let pid = child.id();
+        *lock_or_recover(&proxy.0.child) = Some(ManagedChild {
+            child: Mutex::new(child),
+            _package_lock: None,
+        });
+        assert!(with_proxy_stopped_state(&proxy.0, || Ok(())).is_err());
+        assert!(stop_managed_proxy(&proxy.0, Some(pid.wrapping_add(1))).is_err());
+        assert!(lock_or_recover(&proxy.0.child).as_ref().unwrap().try_wait().unwrap().is_none());
+        assert!(stop_managed_proxy(&proxy.0, Some(pid)).unwrap());
+        assert!(lock_or_recover(&proxy.0.child).is_none());
+        assert_eq!(with_proxy_stopped_state(&proxy.0, || Ok(42)).unwrap(), 42);
+        assert!(!stop_managed_proxy(&proxy.0, Some(pid)).unwrap());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_proxy_holds_package_lock_until_confirmed_exit() {
+        let root = std::env::temp_dir().join(format!(
+            "anybridge-proxy-lock-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let certs_dir = root.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        let package_lock = crate::commands::system::acquire_mitm_package_lock(&certs_dir, false)
+            .unwrap();
+        let proxy = TestProxy(ProxyState::default());
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn test process");
+        let pid = child.id();
+        *lock_or_recover(&proxy.0.child) = Some(ManagedChild {
+            child: Mutex::new(child),
+            _package_lock: package_lock,
+        });
+
+        assert!(crate::commands::system::acquire_mitm_package_lock(&certs_dir, true).is_err());
+        assert!(stop_managed_proxy(&proxy.0, Some(pid)).unwrap());
+        let write_lock = crate::commands::system::acquire_mitm_package_lock(&certs_dir, true);
+        assert!(write_lock.is_ok(), "confirmed child exit must release the shared package lock");
+        drop(write_lock);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn stopped_proxy_reserves_startup_until_certificate_task_returns() {
+        let state = ProxyState::default();
+        let result: Result<(), String> = with_proxy_stopped_state(&state, || {
+            assert!(state.starting.load(Ordering::SeqCst));
+            assert!(with_proxy_stopped_state(&state, || Ok(())).is_err());
+            assert!(state.starting.load(Ordering::SeqCst));
+            Err("certificate task failed".into())
+        });
+        assert_eq!(result.unwrap_err(), "certificate task failed");
+        assert!(!state.starting.load(Ordering::SeqCst));
+        assert_eq!(with_proxy_stopped_state(&state, || Ok(42)).unwrap(), 42);
+        assert!(!state.starting.load(Ordering::SeqCst));
+    }
+
+    // 模拟 spawn 后占位已释放的前提，只验证再次占位；不替代完整启动/重试集成测试。
+    #[test]
+    fn runtime_repair_reacquires_released_startup_reservation() {
+        let state = ProxyState::default();
+        state.starting.store(true, Ordering::SeqCst);
+        state.starting.store(false, Ordering::SeqCst);
+        assert_eq!(with_proxy_stopped_state(&state, || {
+            assert!(state.starting.load(Ordering::SeqCst));
+            assert!(with_proxy_stopped_state(&state, || Ok(())).is_err());
+            Ok(42)
+        }).unwrap(), 42);
+        assert!(!state.starting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn busy_proxy_does_not_execute_certificate_task_or_release_owner_flag() {
+        let state = ProxyState::default();
+        state.starting.store(true, Ordering::SeqCst);
+        let result = with_proxy_stopped_state(&state, || -> Result<(), String> {
+            panic!("certificate task must not execute while startup is reserved")
+        });
+        assert!(result.is_err());
+        assert!(state.starting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn panicking_certificate_task_releases_startup_reservation() {
+        let state = ProxyState::default();
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_proxy_stopped_state(&state, || -> Result<(), String> {
+                panic!("certificate task panicked")
+            });
+        });
+        assert!(result.is_err());
+        assert!(!state.starting.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn certificate_repair_requires_explicit_permission() {
+        assert!(!super::certificate_package_repair_allowed(true, false));
+        assert!(!super::certificate_package_repair_allowed(false, true));
+        assert!(super::certificate_package_repair_allowed(true, true));
+        assert!(!super::certificate_package_repair_allowed(false, false));
+    }
+
+    #[test]
+    fn failed_package_repair_blocks_automatic_trust_mutations() {
+        let failed = super::ProxyPreflightIssue {
+            level: "err".into(),
+            code: "certs.generate_failed".into(),
+            message: "证书包状态不确定".into(),
+        };
+        assert!(super::certificate_package_repair_failed(&[failed]));
+        let unrelated = super::ProxyPreflightIssue {
+            level: "err".into(),
+            code: "cert.system_trust_failed".into(),
+            message: "trust failure".into(),
+        };
+        assert!(!super::certificate_package_repair_failed(&[unrelated]));
+        assert!(!super::certificate_package_repair_failed(&[]));
+    }
+
+    #[test]
+    fn recent_tls_rejection_is_independent_and_expires() {
+        let now = 2_000_000;
+        let issue = super::recent_tls_rejection_issue(now, now - 60_000).unwrap();
+        assert_eq!(issue.code, "cert.tls_client_rejection_recent");
+        assert_eq!(issue.level, "err");
+        assert!(issue.message.contains("客户端身份未知"));
+        assert!(super::recent_tls_rejection_issue(now, now - 30 * 60 * 1000 - 1).is_none());
+        assert!(super::recent_tls_rejection_issue(now, now + 1).is_none());
+        assert!(super::recent_tls_rejection_issue(now, 0).is_none());
+    }
+
+    #[test]
+    fn certificate_failures_are_not_successful_routes() {
+        assert_eq!(classify("MITM TLS error: alert bad certificate"), "err");
+        assert_eq!(classify("客户端拒绝了 MITM 证书 → 请检查信任"), "err");
+        assert_eq!(classify("CONNECT error → upstream: closed"), "err");
+        assert_eq!(classify("request → upstream"), "ok");
+        assert_eq!(classify("errors=0"), "info");
     }
 }
 
@@ -390,11 +673,24 @@ where
             if trimmed.is_empty() {
                 continue;
             }
+            let tls_rejection = trimmed == "ANYBRIDGE_EVENT:TLS_CLIENT_CERT_REJECTED";
+            let msg = if tls_rejection {
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|duration| duration.as_millis() as u64)
+                    .unwrap_or(0);
+                if now_ms > 0 {
+                    LAST_TLS_REJECTION_AT_MS.store(now_ms, Ordering::Relaxed);
+                }
+                "近期检测到 TLS 客户端拒绝或未能验证代理证书（未识别客户端身份）".to_string()
+            } else {
+                trimmed.to_string()
+            };
             let _ = app.emit(
                 "proxy-log",
                 LogLine {
-                    level: classify(trimmed),
-                    msg: trimmed.to_string(),
+                    level: if tls_rejection { "err".into() } else { classify(trimmed) },
+                    msg,
                 },
             );
         }
@@ -432,6 +728,24 @@ fn resolve_target_ide_arg(target_ide: Option<&str>) -> Result<String, String> {
     }
 }
 
+// 证书包修复只允许显式体检操作；代理启动预检即使修复其他项目也必须只读证书/信任。
+fn certificate_package_repair_allowed(repair: bool, allow_certificate_repair: bool) -> bool {
+    repair && allow_certificate_repair
+}
+
+// 证书包生成、提交或回读校验失败时，禁止继续自动修改系统信任状态。
+fn certificate_package_repair_failed(issues: &[ProxyPreflightIssue]) -> bool {
+    issues.iter().any(|issue| {
+        matches!(
+            issue.code.as_str(),
+            "certs.generate_failed"
+                | "certs.generate_incomplete"
+                | "certs.san_generate_failed"
+                | "certs.san_regenerate_failed"
+        )
+    })
+}
+
 fn push_issue(
     issues: &mut Vec<ProxyPreflightIssue>,
     level: &str,
@@ -443,6 +757,24 @@ fn push_issue(
         code: code.into(),
         message: message.into(),
     });
+}
+
+// 事件只在本桌面进程内有效；墙钟回退或事件超出窗口时不显示为近期问题。
+fn recent_tls_rejection_issue(now_ms: u64, last_seen_ms: u64) -> Option<ProxyPreflightIssue> {
+    if last_seen_ms == 0
+        || now_ms < last_seen_ms
+        || now_ms.saturating_sub(last_seen_ms) > TLS_REJECTION_RECENT_WINDOW_MS
+    {
+        return None;
+    }
+    Some(ProxyPreflightIssue {
+        level: "err".into(),
+        code: "cert.tls_client_rejection_recent".into(),
+        message: format!(
+            "最近 30 分钟内检测到 TLS 客户端拒绝或未能验证代理证书（{} 分钟前）；客户端身份未知。请先核对当前 CA 信任状态，并完全重启代理和 IDE。",
+            now_ms.saturating_sub(last_seen_ms) / 60_000
+        ),
+    })
 }
 
 fn settings_backup_path(settings: &Path) -> PathBuf {
@@ -580,46 +912,65 @@ fn probe_mitm_tls(
         .with_root_certificates(roots)
         .with_no_client_auth();
 
+    // ---------------------------------
     // 1. 连接代理并发送 CONNECT，建立到 MITM 主机的隧道
+    // ---------------------------------
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let mut tcp = TcpStream::connect_timeout(&addr, timeout)
+    // 网络各阶段共享同一预算；文件读取和本地证书计算不属于可中断网络 I/O。
+    let deadline = Instant::now().checked_add(timeout)
+        .ok_or_else(|| "TLS 探针超时参数过大".to_string())?;
+    let socket = TcpStream::connect_timeout(&addr, probe_time_remaining(deadline).map_err(|e| e.to_string())?)
         .map_err(|e| format!("CONNECT/TLS 探针连接代理失败: {}", e))?;
-    let _ = tcp.set_read_timeout(Some(timeout));
-    let _ = tcp.set_write_timeout(Some(timeout));
+    let mut tcp = ProbeSocket { socket, deadline };
     tcp.write_all(
         b"CONNECT server.codeium.com:443 HTTP/1.1\r\nHost: server.codeium.com:443\r\n\r\n",
     )
     .map_err(|e| format!("CONNECT/TLS 握手失败: 发送 CONNECT 失败: {}", e))?;
-    let mut head = [0u8; 512];
-    let n = tcp
-        .read(&mut head)
-        .map_err(|e| format!("CONNECT/TLS 握手失败: 读取 CONNECT 响应失败: {}", e))?;
-    let connect_resp = String::from_utf8_lossy(&head[..n]);
-    if !connect_resp.starts_with("HTTP/1.1 200") && !connect_resp.starts_with("HTTP/1.0 200") {
-        return Err(format!(
-            "CONNECT/TLS 握手失败: 隧道建立失败: {}",
-            connect_resp.lines().next().unwrap_or("").trim()
-        ));
-    }
+    read_connect_response(&mut tcp)?;
 
-    // 2. 在隧道上做 rustls TLS 握手（严格校验：叶子证书必须由磁盘 CA 签发）
+    // ---------------------------------
+    // 2.在隧道上做 rustls TLS 握手（严格校验：叶子证书必须由磁盘 CA 签发）
+    // ---------------------------------
     let server_name = "server.codeium.com"
         .try_into()
         .map_err(|_| "CONNECT/TLS 握手失败: 服务器名无效".to_string())?;
     let mut conn = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|e| format!("CONNECT/TLS 握手失败: {}", e))?;
+
+    // 完成严格握手后核对实际叶子；同一个 CA 签发的旧叶子也不能冒充当前磁盘包。
+    while conn.is_handshaking() {
+        conn.complete_io(&mut tcp)
+            .map_err(|e| format!("CONNECT/TLS 握手失败: {}", e))?;
+    }
+    let peer = conn.peer_certificates().and_then(|chain| chain.first())
+        .ok_or_else(|| "TLS 探针未获得运行态叶子证书".to_string())?;
+    let leaf_path = cert_path.with_file_name(crate::commands::system::MITM_LEAF_CERT_FILE);
+    let leaf_pem = std::fs::read_to_string(&leaf_path)
+        .map_err(|e| format!("读取磁盘叶子证书失败: {}", e))?;
+    let disk_leaf = pem_cert_der(&leaf_pem)
+        .ok_or_else(|| "磁盘叶子证书 PEM 无效".to_string())?;
+    verify_runtime_leaf(peer.as_ref(), &disk_leaf)?;
     let mut tls = rustls::Stream::new(&mut conn, &mut tcp);
 
+    // ---------------------------------
     // 3. 发送 mitm-health 请求并读取响应
+    // ---------------------------------
     tls.write_all(
         b"GET /__byok/mitm-health HTTP/1.1\r\nHost: server.codeium.com\r\nConnection: close\r\n\r\n",
     )
     .map_err(|e| format!("CONNECT/TLS 握手失败: {}", e))?;
     let mut response = String::new();
-    tls.read_to_string(&mut response)
+    // 健康响应应很小；额外读一个字节区分达到上限和超限，禁止无界分配。
+    tls.take(65537).read_to_string(&mut response)
         .map_err(|e| format!("CONNECT/TLS 握手失败: {}", e))?;
+    if response.len() > 65536 {
+        return Err("MITM TLS 探针响应超过 64 KiB".into());
+    }
+    probe_time_remaining(deadline).map_err(|e| e.to_string())?;
 
+    // ---------------------------------
     // 4. 校验响应：200 + ok:true + source:mitm + upstream:server.codeium.com
+    // ---------------------------------
     let status_ok = response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200");
     let body = response.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
     let json = serde_json::from_str::<serde_json::Value>(body)
@@ -630,6 +981,72 @@ fn probe_mitm_tls(
         || json.get("upstream").and_then(|v| v.as_str()) != Some("server.codeium.com")
     {
         return Err(format!("TLS 已连接但未进入 MITM: body={}", body));
+    }
+    Ok(())
+}
+
+// 每次实际 socket I/O 都更新剩余预算，覆盖 rustls complete_io 内部的多次读写。
+// 不使用后台计时线程；超时错误沿原探针失败路径传播，socket 随栈退出关闭。
+struct ProbeSocket {
+    socket: TcpStream,
+    deadline: Instant,
+}
+
+fn probe_time_remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "TLS 探针网络总预算已耗尽"))
+}
+
+impl Read for ProbeSocket {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.socket.set_read_timeout(Some(probe_time_remaining(self.deadline)?))?;
+        self.socket.read(buf)
+    }
+}
+
+impl Write for ProbeSocket {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.socket.set_write_timeout(Some(probe_time_remaining(self.deadline)?))?;
+        self.socket.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.socket.set_write_timeout(Some(probe_time_remaining(self.deadline)?))?;
+        self.socket.flush()
+    }
+}
+
+// CONNECT 头可能跨多个 TCP 包；逐字节读取到空行，不吞掉属于后续 TLS 的字节。
+// 8 KiB 限制约束内存和读取次数；网络读取仍使用调用方的 socket 超时。
+fn read_connect_response(reader: &mut impl Read) -> Result<(), String> {
+    let mut head = Vec::new();
+    while head.len() < 8192 {
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte)
+            .map_err(|e| format!("读取 CONNECT 响应头失败: {}", e))?;
+        head.push(byte[0]);
+        if head.ends_with(b"\r\n\r\n") {
+            let text = std::str::from_utf8(&head)
+                .map_err(|_| "CONNECT 响应头编码无效".to_string())?;
+            let mut status = text.lines().next().unwrap_or("").split_whitespace();
+            if matches!(status.next(), Some("HTTP/1.1") | Some("HTTP/1.0"))
+                && status.next() == Some("200") {
+                return Ok(());
+            }
+            // 不回显远端响应头，避免代理认证等敏感字段进入日志。
+            return Err("CONNECT 隧道未返回 HTTP 200".into());
+        }
+    }
+    Err("CONNECT 响应头超过 8 KiB 或缺少结束空行".into())
+}
+
+// 只记录公开证书指纹，不记录 PEM 或私钥；一致性检查不能替代上面的严格 TLS 链验证。
+fn verify_runtime_leaf(runtime: &[u8], disk: &[u8]) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let runtime_hash = hex::encode(Sha256::digest(runtime));
+    let disk_hash = hex::encode(Sha256::digest(disk));
+    if runtime_hash != disk_hash {
+        return Err(format!("运行态/磁盘叶子证书指纹不一致，TLS 探针未通过: runtime={} disk={}", runtime_hash, disk_hash));
     }
     Ok(())
 }
@@ -657,48 +1074,22 @@ struct MitmReadyReport {
     message: String,
 }
 
-/// 仅当错误表明 PEM/密钥文件本身坏了时才强制重生。
-/// 信任库安装失败（GPO/权限）不应触发重生，否则会改 fingerprint 造成装证循环。
-fn is_mitm_cert_file_error(err: &str) -> bool {
-    const MARKERS: &[&str] = &[
-        "MITM 证书/私钥",
-        "读取 MITM 证书",
-        "读取 MITM 私钥",
-        "证书文件",
-        "自动生成证书",
-        "无法创建证书目录",
-        "SAN 标记",
-        "解析或匹配失败",
-        "证书不完整",
-        "仍不完整",
-        // write_atomic / ensure_mitm_certs_ex 写盘失败：属于证书文件问题，值得一次强制重生重试
-        "证书路径缺少父目录",
-        "无法创建目录",
-        "写入临时文件失败",
-        "原子写入证书失败",
-        "证书写入后校验失败",
-    ];
-    MARKERS.iter().any(|m| err.contains(m))
-}
-
-/// 代理启动路径：只静默装 CurrentUser，绝不自动 UAC。
-/// 管理员安装只允许用户在「环境检测」显式点击。
-fn ensure_proxy_mitm_ready_once(force_regenerate: bool) -> Result<String, String> {
-    let (certs_dir, generated) =
-        crate::commands::system::ensure_mitm_certs_ex(force_regenerate)?;
-    let cert_path = certs_dir.join("server.codeium.com.pem");
-    let key_path = certs_dir.join("server.codeium.com-key.pem");
-    crate::commands::system::validate_mitm_cert_files(&cert_path, &key_path)?;
-    let install_message = crate::commands::cert_install::install_ca_with_options(
-        false,
-        force_regenerate || generated,
-    )
-    .map_err(|e| format!("MITM CA 未能安装到系统根证书库: {}", e))?;
-    let status = crate::commands::cert_install::check_ca_status();
+/// 代理启动路径只读验证现有包和系统信任；证书生成/轮换必须由显式操作发起。
+/// 管理员安装只允许用户在「环境检测」显式点击；后台启动不能依赖交互授权。
+fn ensure_proxy_mitm_ready_once() -> Result<String, String> {
+    // 先确认磁盘包完整，再按其 CA 指纹检查系统信任，避免校验另一份证书材料。
+    let certs_dir = crate::commands::system::validate_existing_mitm_package()?;
+    // 代理启动属于后台路径：只检查当前 CA 是否已经可信，不自动弹出 macOS
+    // 管理员授权。信任变更必须由环境检测中的显式用户操作完成。
+    let status = crate::commands::cert_install::check_ca_status_fresh();
     if matches!(status.effective_store, crate::commands::cert_install::CaStore::None) {
+        let reason = status
+            .trust_error
+            .as_deref()
+            .unwrap_or("当前证书指纹未通过系统信任检查");
         return Err(format!(
-            "MITM CA 安装后仍未在信任库中找到当前证书指纹。{}。请到「环境检测」手动安装证书（可能需要管理员授权）",
-            install_message
+            "MITM CA 尚未完成系统信任验证: {}。请到「环境检测」手动安装证书并完成授权",
+            reason
         ));
     }
     Ok(format!(
@@ -710,27 +1101,12 @@ fn ensure_proxy_mitm_ready_once(force_regenerate: bool) -> Result<String, String
 }
 
 fn ensure_proxy_mitm_ready() -> Result<MitmReadyReport, String> {
-    match ensure_proxy_mitm_ready_once(false) {
-        Ok(message) => Ok(MitmReadyReport { message }),
-        Err(first_error) if is_mitm_cert_file_error(&first_error) => {
-            match ensure_proxy_mitm_ready_once(true) {
-                Ok(message) => Ok(MitmReadyReport {
-                    message: format!(
-                        "自动修复后通过（首次原因: {}）；{}",
-                        first_error, message
-                    ),
-                }),
-                Err(repair_error) => Err(format!(
-                    "首次自检失败: {}；自动清理并重装失败: {}。请到「环境检测」手动安装证书（可能需要管理员授权）",
-                    first_error, repair_error
-                )),
-            }
-        }
-        Err(first_error) => Err(format!(
-            "{}。若当前用户信任库被组策略拦截，请到「环境检测」手动安装证书（可能需要管理员授权）",
-            first_error
-        )),
-    }
+    ensure_proxy_mitm_ready_once()
+        .map(|message| MitmReadyReport { message })
+        .map_err(|error| format!(
+            "{}。后台启动未修改证书包或系统信任；如需生成、轮换或授权，请到「环境检测」显式操作",
+            error
+        ))
 }
 
 fn check_provider_route(
@@ -918,10 +1294,29 @@ pub fn get_takeover_state() -> Result<Option<TakeoverState>, String> {
     read_takeover_state(&crate::commands::config::config_dir_path())
 }
 
+// repair 调用方须已持有启动占位；此层只获取证书任务锁，不重复占用 starting。
 fn run_proxy_preflight(
     target_ide: Option<&str>,
     resource_dir: Option<&Path>,
     repair: bool,
+    allow_certificate_repair: bool,
+) -> Result<ProxyPreflightReport, String> {
+    if repair {
+        // 自动修复与显式证书任务共用互斥；只读体检不占用该锁。
+        return crate::commands::cert_install::with_cert_task_lock(|| {
+            run_proxy_preflight_inner(target_ide, resource_dir, true, allow_certificate_repair)
+        });
+    }
+    run_proxy_preflight_inner(target_ide, resource_dir, false, false)
+}
+
+// 内部实现不获取外层锁，供已持有证书互斥及代理占位的入口复用，避免嵌套获取。
+// allow_certificate_repair 只由用户显式发起的体检设置；代理启动预检仍可修复 IDE 配置但不改证书/信任。
+fn run_proxy_preflight_inner(
+    target_ide: Option<&str>,
+    resource_dir: Option<&Path>,
+    repair: bool,
+    allow_certificate_repair: bool,
 ) -> Result<ProxyPreflightReport, String> {
     let target = resolve_target_ide_arg(target_ide)?;
     let mut issues = Vec::new();
@@ -990,8 +1385,8 @@ fn run_proxy_preflight(
         && leaf_key_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
         && crate::commands::system::validate_mitm_cert_files(&leaf_path, &leaf_key_path).is_ok();
     if !cert_ok || !key_ok || !cert_contents_ok || !leaf_ok {
-        if repair {
-            // 只生成 PEM，不走完整 install（避免 UAC 卡启动/体检）
+        if certificate_package_repair_allowed(repair, allow_certificate_repair) {
+            // 只生成 PEM，不走完整 install（避免授权交互卡住启动/体检）
             match crate::commands::system::ensure_mitm_certs() {
                 Ok((dir, generated)) => {
                     cert_ok = cert_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
@@ -1045,14 +1440,14 @@ fn run_proxy_preflight(
                 "err",
                 "certs.missing",
                 format!(
-                    "MITM 证书缺失、为空或内容无效；点击「安装证书」会自动生成并安装，也可以点击「生成证书」单独生成（文件: {}, {}）",
+                    "MITM 证书缺失、为空或内容无效；请先点击「生成证书」，再点击「安装证书」完成当前平台信任设置（文件: {}, {}）",
                     cert_path.to_string_lossy(),
                     key_path.to_string_lossy()
                 ),
             );
         }
     } else if !san_ok || crate::commands::system::mitm_certs_need_renewal(&cert_dir) {
-        if repair {
+        if certificate_package_repair_allowed(repair, allow_certificate_repair) {
             match crate::commands::system::ensure_mitm_certs_ex(true) {
                 Ok((dir, _)) => {
                     san_ok = std::fs::read_to_string(&san_marker_path)
@@ -1095,11 +1490,15 @@ fn run_proxy_preflight(
         }
     }
 
-    // 证书信任状态检查（升级路径：用户在装了 BYOK 但没装证书的机器上会卡这里）
-    // repair=true 时提权安装到 LocalMachine\Root（UAC 授权后静默，无 Windows 安全警告）；
-    // 提权失败再降级 CurrentUser\Root。
-    let mut ca_status = crate::commands::cert_install::check_ca_status();
-    if repair {
+    // repair 路径读取新鲜信任状态；只有显式环境体检允许无提权用户级修复，系统级信任仍须显式安装。
+    let mut ca_status = if repair {
+        crate::commands::cert_install::check_ca_status_fresh()
+    } else {
+        crate::commands::cert_install::check_ca_status()
+    };
+    if certificate_package_repair_allowed(repair, allow_certificate_repair)
+        && !certificate_package_repair_failed(&issues)
+    {
         // 证书刚被重生过（SAN 版本升级）时也必须重装：信任库里同 CN 的旧指纹已经验不了新链。
         // prefer_fresh_install 会先清掉同 CN 下不匹配的旧指纹，避免同名多证书打架。
         if (cert_regenerated
@@ -1109,9 +1508,10 @@ fn run_proxy_preflight(
             ))
             && (ca_status.cert_exists || cert_ok)
         {
-            match crate::commands::cert_install::install_ca_with_options(false, cert_regenerated) {
+            // 启动/体检修复只能尝试用户级、非提权安装；系统级信任必须由用户显式操作。
+            match crate::commands::cert_install::install_ca_user_only(false, cert_regenerated) {
                 Ok(msg) => {
-                    ca_status = crate::commands::cert_install::check_ca_status();
+                    ca_status = crate::commands::cert_install::check_ca_status_fresh();
                     if !matches!(
                         ca_status.effective_store,
                         crate::commands::cert_install::CaStore::None
@@ -1145,10 +1545,14 @@ fn run_proxy_preflight(
                 ),
             }
         }
-        if ca_status.legacy_residual {
+        // macOS 清理旧根可能请求管理员授权；后台只报告残留，由用户显式清理。
+        if !certificate_package_repair_failed(&issues)
+            && ca_status.legacy_residual
+            && cfg!(target_os = "windows")
+        {
             match crate::commands::cert_install::cleanup_legacy_cn() {
                 Ok(msg) => {
-                    ca_status = crate::commands::cert_install::check_ca_status();
+                    ca_status = crate::commands::cert_install::check_ca_status_fresh();
                     if !ca_status.legacy_residual {
                         push_issue(
                             &mut issues,
@@ -1162,7 +1566,7 @@ fn run_proxy_preflight(
                             "warn",
                             "cert.legacy_cleanup_partial",
                             format!(
-                                "已尝试清理老证书，但仍有残留（可能需要管理员权限）: {}",
+                                "已尝试清理老证书，但仍有残留（可能需要系统授权）: {}",
                                 msg
                             ),
                         );
@@ -1177,6 +1581,20 @@ fn run_proxy_preflight(
             }
         }
     }
+    // 独立报告系统信任错误，避免被证书存在性检查或通用“未安装”提示掩盖。
+    if let Some(error) = &ca_status.trust_error {
+        push_issue(&mut issues, "err", "cert.system_trust_failed", error.clone());
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0);
+    if let Some(issue) = recent_tls_rejection_issue(
+        now_ms,
+        LAST_TLS_REJECTION_AT_MS.load(Ordering::Relaxed),
+    ) {
+        issues.push(issue);
+    }
     match ca_status.effective_store {
         crate::commands::cert_install::CaStore::CurrentUser => {
             push_issue(
@@ -1184,7 +1602,7 @@ fn run_proxy_preflight(
                 "ok",
                 "cert.trust_current_user",
                 format!(
-                    "当前 CA 证书已装到 {}（无需管理员权限）。{}",
+                    "当前 CA 证书已装到 {}。{}",
                     crate::commands::cert_install::current_user_store_label(),
                     ca_status
                         .thumbprint
@@ -1211,15 +1629,14 @@ fn run_proxy_preflight(
             );
         }
         crate::commands::cert_install::CaStore::None => {
-            // 证书文件存在但没装到系统 → 提示用户一键安装（无管理员弹窗或 UAC 一次）
+            // 证书文件存在但未完成系统信任 → 提示用户显式授权安装
             if ca_status.cert_exists {
                 push_issue(
                     &mut issues,
                     "err",
                     "cert.not_trusted",
                     format!(
-                        "当前 CA 证书已生成但未安装到系统根证书库。点「安装证书」可装到 {}（无需管理员），失败才弹 UAC；若仍异常请点「清理并重装」",
-                        crate::commands::cert_install::current_user_store_label()
+                        "当前 CA 证书已生成但未完成系统信任。点「安装证书」执行显式授权；若仍异常请查看具体错误，不要反复重生证书"
                     ),
                 );
             }
@@ -1936,19 +2353,21 @@ pub fn preflight_proxy_impl(
         .resource_dir()
         .ok()
         .and_then(|p| resolve_resources_root(Some(&p)));
-    let proxy_running = app
-        .try_state::<ProxyState>()
-        .and_then(|state| {
-            lock_or_recover(&state.child)
-                .as_ref()
-                .map(|managed| managed.try_wait().ok().flatten().is_none())
+    let state = app.state::<ProxyState>();
+    // 忙碌时仅只读体检；此快照不是互斥，空闲分支仍需在任务内重新检查并占位。
+    let proxy_busy = state.starting.load(Ordering::SeqCst)
+        || lock_or_recover(&state.child)
+            .as_ref()
+            .map(|managed| managed.try_wait().ok().flatten().is_none())
+            .unwrap_or(false);
+    if proxy_busy {
+        return run_proxy_preflight(target_ide.as_deref(), resource_dir.as_deref(), false, false);
+    }
+    crate::commands::cert_install::with_cert_task_lock(|| {
+        with_proxy_stopped(&app, || {
+            run_proxy_preflight_inner(target_ide.as_deref(), resource_dir.as_deref(), true, true)
         })
-        .unwrap_or(false);
-    run_proxy_preflight(
-        target_ide.as_deref(),
-        resource_dir.as_deref(),
-        !proxy_running,
-    )
+    })
 }
 
 #[tauri::command]
@@ -2098,21 +2517,31 @@ pub fn start_proxy_impl(
     // TOCTOU 防护：检查"已运行 / 正在启动",并在同一临界区抢占 starting 标志。
     // 注意：child 存在不代表进程还活着，需 try_wait 确认（进程意外退出但监控线程尚未清理时）。
     {
-        let guard = lock_or_recover(&state.child);
+        let mut guard = lock_or_recover(&state.child);
         if let Some(managed) = guard.as_ref() {
             if managed.try_wait().ok().flatten().is_none() {
                 // 进程仍在运行
                 return Err("代理已在运行".into());
             }
             // 进程已退出但 child 未清理，先清理再允许启动
-            drop(guard);
-            *lock_or_recover(&state.child) = None;
+            *guard = None;
         }
         if state.starting.swap(true, Ordering::SeqCst) {
             return Err("代理正在启动中".into());
         }
     }
     let clear_starting = || state.starting.store(false, Ordering::SeqCst);
+    // 从启动校验一直持锁到 child 退出，防止另一个桌面实例在代理运行中轮换 CA。
+    let package_lock = match crate::commands::system::acquire_mitm_package_lock(
+        &crate::commands::config::config_dir_path().join("certs"),
+        false,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            clear_starting();
+            return Err(error);
+        }
+    };
 
     // 解析目标 IDE（auto 模式需实际检测），校验只允许 windsurf/devin。
     let target = match resolve_target_ide_arg(target_ide.as_deref()) {
@@ -2125,6 +2554,26 @@ pub fn start_proxy_impl(
 
     let config_dir = crate::commands::config::config_dir_path();
     let ports = configured_ports();
+    // 记录用户请求值和解析结果，便于区分自动检测/保存配置导致的目标 IDE 偏差。
+    let requested_target = target_ide.as_deref().unwrap_or("saved/auto");
+    let settings_path = crate::commands::ide_config::settings_path(&target);
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!(
+                "代理启动诊断: requested_target={} resolved_target={} settings={} api_port={} inference_port={}",
+                requested_target,
+                target,
+                settings_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "unresolved".into()),
+                ports.api_port,
+                ports.inference_port,
+            ),
+        },
+    );
 
     let resource_dir = app
         .path()
@@ -2136,7 +2585,8 @@ pub fn start_proxy_impl(
     kill_sidecar_process();
 
     if !skip_preflight {
-        let preflight = match run_proxy_preflight(Some(&target), resource_dir.as_deref(), true) {
+        // 启动预检可修复 IDE 配置等项目，但证书包和系统信任必须只读检查。
+        let preflight = match run_proxy_preflight(Some(&target), resource_dir.as_deref(), true, false) {
             Ok(r) => r,
             Err(e) => {
                 clear_starting();
@@ -2200,8 +2650,10 @@ pub fn start_proxy_impl(
                     }
                 }
             }
-            let mut c = std::process::Command::new(&sidecar_path);
-            // Windows: 设置进程创建标志，阻止 CMD 窗口弹出
+            let c = std::process::Command::new(&sidecar_path);
+            // 仅 Windows 的 creation_flags 需要可变 Command；Unix 保持不可变以避免平台警告。
+            #[cfg(target_os = "windows")]
+            let mut c = c;
             #[cfg(target_os = "windows")]
             c.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             c
@@ -2233,10 +2685,13 @@ pub fn start_proxy_impl(
     // 在写入 state 之前取出管道（避免锁竞争）
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // 记录本轮进程身份，后续监控及健康检查失败只能处理这一个进程。
+    let proxy_pid = child.id();
 
     // 写入 child 并清除 starting 标志
     *lock_or_recover(&state.child) = Some(ManagedChild {
         child: Mutex::new(child),
+        _package_lock: package_lock,
     });
     *lock_or_recover(&state.target_ide) = target.clone();
     *lock_or_recover(&state.ports) = Some(ports);
@@ -2283,6 +2738,33 @@ pub fn start_proxy_impl(
             false
         }
     };
+    // 回读落盘配置，确认代理地址和 Devin 专用设置确实写入目标 IDE 的 settings 文件。
+    match crate::commands::ide_config::status(&target) {
+        Ok(status) => {
+            let _ = app.emit(
+                "proxy-log",
+                LogLine {
+                    level: if status.patched { "info" } else { "warn" }.into(),
+                    msg: format!(
+                        "IDE 配置复核: target={} patched={} proxy={} settings={}",
+                        target,
+                        status.patched,
+                        status.proxy_value,
+                        status.settings_path,
+                    ),
+                },
+            );
+        }
+        Err(error) => {
+            let _ = app.emit(
+                "proxy-log",
+                LogLine {
+                    level: "warn".into(),
+                    msg: format!("IDE 配置复核失败: target={} error={}", target, error),
+                },
+            );
+        }
+    }
 
     // 注入卡片改写脚本到 workbench.html（失败不阻断代理启动，仅记日志）。
     if target == "cursor" {
@@ -2353,7 +2835,8 @@ pub fn start_proxy_impl(
         let exit_status = if let Some(state) = app_handle2.try_state::<ProxyState>() {
             let guard = lock_or_recover(&state.child);
             match guard.as_ref() {
-                Some(managed) => managed.try_wait().ok().flatten(),
+                Some(managed) if managed.id() == proxy_pid => managed.try_wait().ok().flatten(),
+                Some(_) => break,
                 // child 为 None 说明 stop_proxy 已 take 走了 child 并负责清理，
                 // 这里直接退出循环，不再误判为进程退出。
                 None => {
@@ -2367,7 +2850,12 @@ pub fn start_proxy_impl(
         if let Some(status) = exit_status {
             // 进程真正退出后的清理
             if let Some(state) = app_handle2.try_state::<ProxyState>() {
-                *lock_or_recover(&state.child) = None;
+                let mut guard = lock_or_recover(&state.child);
+                // 轮询与清理之间可能已经重启，持锁复核身份后才允许清除状态和还原 IDE。
+                if guard.as_ref().map(ManagedChild::id) != Some(proxy_pid) {
+                    break;
+                }
+                *guard = None;
                 let target = lock_or_recover(&state.target_ide).clone();
                 // 清除 target_ide
                 *lock_or_recover(&state.target_ide) = String::new();
@@ -2425,10 +2913,8 @@ pub fn start_proxy_impl(
     };
 
     if let Some(e) = health_error {
-        let child = lock_or_recover(&state.child).take();
-        if let Some(child) = child {
-            let _ = child.kill();
-        }
+        stop_managed_proxy(&state, Some(proxy_pid))
+            .map_err(|stop_error| format!("代理自检失败: {}；未能确认本轮代理停止: {}", e, stop_error))?;
         let report = restore_all(&state, &target);
         *lock_or_recover(&state.target_ide) = String::new();
         *lock_or_recover(&state.ports) = None;
@@ -2450,12 +2936,18 @@ pub fn start_proxy_impl(
         return Err(msg);
     }
 
+    // 本地健康检查只证明 sidecar 可用；真实 IDE 接管需等待模型状态请求心跳。
     if missing_ports.is_empty() {
         let _ = app.emit(
             "proxy-log",
             LogLine {
                 level: "ok".into(),
-                msg: format!("✅ 代理健康检查通过: {}", port_pair_text(ports)),
+                msg: format!(
+                    "✅ 代理健康检查通过: target={} pid={} {}；IDE 请求心跳将在收到 Devin/Windsurf 模型状态请求后更新",
+                    target,
+                    proxy_pid,
+                    port_pair_text(ports),
+                ),
             },
         );
     } else {
@@ -2489,31 +2981,56 @@ fn start_proxy_service_impl_with_repair(
     let state = app.state::<ProxyState>();
 
     {
-        let guard = lock_or_recover(&state.child);
+        let mut guard = lock_or_recover(&state.child);
         if let Some(managed) = guard.as_ref() {
             if managed.try_wait().ok().flatten().is_none() {
                 return Err("代理已在运行".into());
             }
-            drop(guard);
-            *lock_or_recover(&state.child) = None;
+            *guard = None;
         }
         if state.starting.swap(true, Ordering::SeqCst) {
             return Err("代理正在启动中".into());
         }
     }
     let clear_starting = || state.starting.store(false, Ordering::SeqCst);
+    // 从启动校验一直持锁到 child 退出，防止另一个桌面实例在代理运行中轮换 CA。
+    let package_lock = match crate::commands::system::acquire_mitm_package_lock(
+        &crate::commands::config::config_dir_path().join("certs"),
+        false,
+    ) {
+        Ok(lock) => lock,
+        Err(error) => {
+            clear_starting();
+            return Err(error);
+        }
+    };
 
     let config_dir = crate::commands::config::config_dir_path();
     let ports = configured_ports();
     let cert_path = config_dir.join("certs").join("server.codeium.com.pem");
+    // 后台启动同样记录运行目录和端口，便于与 UI 手动启动的日志区分。
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!(
+                "后台代理启动诊断: config_dir={} api_port={} inference_port={}",
+                config_dir.display(),
+                ports.api_port,
+                ports.inference_port,
+            ),
+        },
+    );
     let resource_dir = app
         .path()
         .resource_dir()
         .ok()
         .and_then(|p| resolve_resources_root(Some(&p)));
 
-    // 启动前只做静默装证；绝不在此路径弹 UAC。
-    let mitm_report = match ensure_proxy_mitm_ready() {
+    // 启动前只检查现有证书材料；信任变更不在此路径修改钥匙串或弹出管理员授权。
+    // 受管代理从校验到退出持有共享包锁，阻止其他桌面实例并发修改证书。
+    let mitm_result = crate::commands::cert_install::with_cert_task_lock(ensure_proxy_mitm_ready);
+    let mitm_report = match mitm_result {
         Ok(report) => report,
         Err(e) => {
             clear_starting();
@@ -2579,7 +3096,9 @@ fn start_proxy_service_impl_with_repair(
                     }
                 }
             }
-            let mut c = std::process::Command::new(&sidecar_path);
+            let c = std::process::Command::new(&sidecar_path);
+            #[cfg(target_os = "windows")]
+            let mut c = c;
             #[cfg(target_os = "windows")]
             c.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP);
             c
@@ -2608,9 +3127,19 @@ fn start_proxy_service_impl_with_repair(
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
+    // 记录本轮进程身份，后续监控及健康检查失败只能处理这一个进程。
+    let proxy_pid = child.id();
+    let _ = app.emit(
+        "proxy-log",
+        LogLine {
+            level: "info".into(),
+            msg: format!("后台 sidecar 已创建: pid={} api_port={}", proxy_pid, ports.api_port),
+        },
+    );
 
     *lock_or_recover(&state.child) = Some(ManagedChild {
         child: Mutex::new(child),
+        _package_lock: package_lock,
     });
     *lock_or_recover(&state.target_ide) = String::new();
     *lock_or_recover(&state.ports) = Some(ports);
@@ -2639,21 +3168,23 @@ fn start_proxy_service_impl_with_repair(
         std::thread::sleep(std::time::Duration::from_secs(1));
 
         let exit_status = if let Some(state) = app_handle2.try_state::<ProxyState>() {
-            let guard = lock_or_recover(&state.child);
-            match guard.as_ref() {
-                Some(managed) => managed.try_wait().ok().flatten(),
-                None => break,
+            let mut guard = lock_or_recover(&state.child);
+            let status = match guard.as_ref() {
+                Some(managed) if managed.id() == proxy_pid => managed.try_wait().ok().flatten(),
+                _ => break,
+            };
+            // 身份检查与退出清理在同一 child 锁内，旧监控不能清掉新一轮代理。
+            if status.is_some() {
+                *guard = None;
+                *lock_or_recover(&state.target_ide) = String::new();
+                *lock_or_recover(&state.ports) = None;
             }
+            status
         } else {
             break;
         };
 
         if let Some(status) = exit_status {
-            if let Some(state) = app_handle2.try_state::<ProxyState>() {
-                *lock_or_recover(&state.child) = None;
-                *lock_or_recover(&state.target_ide) = String::new();
-                *lock_or_recover(&state.ports) = None;
-            }
             let _ = app_handle2.emit(
                 "proxy-log",
                 LogLine {
@@ -2686,46 +3217,37 @@ fn start_proxy_service_impl_with_repair(
     };
 
     if let Some(failure) = health_error {
-        let child = lock_or_recover(&state.child).take();
-        if let Some(child) = child {
-            let _ = child.kill();
-        }
-        *lock_or_recover(&state.target_ide) = String::new();
-        *lock_or_recover(&state.ports) = None;
+        stop_managed_proxy(&state, Some(proxy_pid))
+            .map_err(|e| format!("代理服务自检失败: {}；未能确认本轮代理停止: {}", failure.message, e))?;
         if failure.mitm_related && allow_runtime_repair {
-            // 仅当 sidecar 明确报告 MITM 未启用（证书文件加载失败）时，才允许一次强制重生。
-            // TLS 握手失败本身不重生证书：健康探针信任的是磁盘 PEM，乱重生只会改 fingerprint 并诱发装证循环。
-            // 运行时修复绝不弹 UAC。
-            let force_regenerate = failure.message.contains("MITM 未启用");
+            // 运行时“修复”不改证书或信任，只在停机后复核现有状态并最多尝试一次重启。
             let _ = app.emit(
                 "proxy-log",
                 LogLine {
                     level: "warn".into(),
                     msg: format!(
-                        "MITM/TLS 实链路自检失败，正在{}并仅重启一次（无 UAC）: {}",
-                        if force_regenerate {
-                            "强制重生证书"
-                        } else {
-                            "静默重装当前用户 CA"
-                        },
+                        "MITM/TLS 实链路自检失败，正在只读复核证书材料与系统信任并仅重启一次: {}",
                         failure.message
                     ),
                 },
             );
-            match ensure_proxy_mitm_ready_once(force_regenerate) {
+            // spawn 后 starting 已释放，修复必须重新占位；闭包结束释放两层保护，重启再走正常检查。
+            match crate::commands::cert_install::with_cert_task_lock(|| {
+                with_proxy_stopped(&app, || ensure_proxy_mitm_ready_once())
+            }) {
                 Ok(report) => {
                     let _ = app.emit(
                         "proxy-log",
                         LogLine {
-                            level: "ok".into(),
-                            msg: format!("MITM 证书已修复，正在重新启动代理: {}", report),
+                            level: "info".into(),
+                            msg: format!("MITM 证书材料与系统信任复核通过，正在重新启动代理: {}", report),
                         },
                     );
                     return start_proxy_service_impl_with_repair(app, false);
                 }
                 Err(repair_error) => {
                     let msg = format!(
-                        "代理服务启动失败: {}；MITM 自动修复失败: {}。请到「环境检测」手动安装证书（可能需要管理员授权）",
+                        "代理服务启动失败: {}；MITM 证书材料或系统信任复核未通过: {}。请到「环境检测」显式处理证书或授权",
                         failure.message, repair_error
                     );
                     let _ = app.emit("proxy-stopped", ());
@@ -2780,15 +3302,26 @@ fn start_proxy_service_impl_with_repair(
     Ok(true)
 }
 
+// expected_pid 防止旧启动任务停止后来启动的代理；kill 失败时保留句柄及关联状态。
+// child 锁覆盖确认退出与状态清理，不会先公布“已停止”再尝试终止进程。
+fn stop_managed_proxy(state: &ProxyState, expected_pid: Option<u32>) -> Result<bool, String> {
+    let mut guard = lock_or_recover(&state.child);
+    let Some(child) = guard.as_ref() else {
+        return Ok(false);
+    };
+    if expected_pid.is_some_and(|pid| pid != child.id()) {
+        return Err("代理进程已更换，本次停止操作未执行".into());
+    }
+    child.kill()?;
+    *guard = None;
+    *lock_or_recover(&state.target_ide) = String::new();
+    *lock_or_recover(&state.ports) = None;
+    Ok(true)
+}
+
 pub fn stop_proxy_service_impl(app: AppHandle) -> Result<(), String> {
     let state = app.state::<ProxyState>();
-    let child = lock_or_recover(&state.child).take();
-    if let Some(child) = child {
-        if let Err(e) = child.kill() {
-            eprintln!("[stop_proxy_service] kill 失败（进程可能已退出）: {}", e);
-        }
-        *lock_or_recover(&state.target_ide) = String::new();
-        *lock_or_recover(&state.ports) = None;
+    if stop_managed_proxy(&state, None)? {
         let _ = app.emit("proxy-stopped", ());
         let _ = app.emit(
             "proxy-log",
@@ -2882,16 +3415,14 @@ pub fn stop_proxy_impl(
     _target_ide: Option<String>,
 ) -> Result<RestoreReport, String> {
     let state = app.state::<ProxyState>();
-    let child = lock_or_recover(&state.child).take();
-    if let Some(child) = child {
-        // 无论 kill 是否成功，都必须还原配置；kill 失败仅记日志不阻断。
-        if let Err(e) = child.kill() {
-            eprintln!("[stop_proxy] kill 失败（进程可能已退出）: {}", e);
-        }
+    let mut child_guard = lock_or_recover(&state.child);
+    if let Some(child) = child_guard.as_ref() {
+        // 先确认进程已退出，再释放句柄或还原 IDE，避免代理仍运行时状态已被误报为停止。
+        child.kill()?;
         // 还原 IDE 配置：使用 start_proxy 时保存的 target_ide，
         // 而非重新检测或参数传入值——确保还原目标与打补丁时一致。
         let target = lock_or_recover(&state.target_ide).clone();
-        // 清除 target_ide，防止残留旧值被后续误用
+        *child_guard = None;
         *lock_or_recover(&state.target_ide) = String::new();
         *lock_or_recover(&state.ports) = None;
         if target.is_empty() || (target != "windsurf" && target != "devin" && target != "cursor") {

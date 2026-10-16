@@ -1,3 +1,5 @@
+#[cfg(unix)]
+use std::fs::File;
 use std::process::Command;
 use tauri::{
     image::Image,
@@ -92,12 +94,28 @@ pub(crate) fn validate_mitm_cert_files(
         .map_err(|e| format!("读取 MITM 证书失败 {}: {}", cert_path.to_string_lossy(), e))?;
     let key_pem = std::fs::read(key_path)
         .map_err(|e| format!("读取 MITM 私钥失败 {}: {}", key_path.to_string_lossy(), e))?;
+    validate_mitm_key_pair(&cert_pem, &key_pem)?;
     let mut identity_pem = cert_pem;
     identity_pem.extend_from_slice(b"\n");
     identity_pem.extend_from_slice(&key_pem);
     reqwest::Identity::from_pem(&identity_pem)
         .map_err(|e| format!("MITM 证书/私钥解析或匹配失败: {}", e))?;
     Ok(())
+}
+
+// Identity 解析不作为密钥匹配的保证；显式比较首张证书与私钥的公钥，无法确认也拒绝。
+// 这里不校验签名链、证书角色、SAN 或系统信任；使用局部 provider，不改变全局 TLS 配置。
+fn validate_mitm_key_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<(), String> {
+    use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
+    let certificates = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("MITM 证书解析失败: {}", e))?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem)
+        .map_err(|e| format!("MITM 私钥解析失败: {}", e))?;
+    let provider = rustls::crypto::ring::default_provider();
+    let certified = rustls::sign::CertifiedKey::from_der(certificates, key, &provider)
+        .map_err(|e| format!("MITM 证书/私钥校验失败: {}", e))?;
+    certified.keys_match().map_err(|e| format!("MITM 证书/私钥不匹配或无法确认: {}", e))
 }
 
 /// MITM 叶子证书文件名（hybrid-server 实际向客户端呈现的证书 + CA 链）。
@@ -637,7 +655,10 @@ fn reveal_path_impl(target: &std::path::Path) -> Result<(), String> {
     Ok(())
 }
 
+/// 将单个证书或私钥先写入同目录临时文件，再提交为目标文件。
+/// 这里只保证单文件替换的原子性，不保证 CA、私钥、叶子证书和版本标记整体事务一致。
 fn write_atomic(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<(), String> {
+    // 临时文件必须与目标文件位于同一目录，Unix/macOS 才能通过 rename 原子替换目标。
     let parent = path
         .parent()
         .ok_or_else(|| format!("证书路径缺少父目录: {}", path.to_string_lossy()))?;
@@ -648,20 +669,37 @@ fn write_atomic(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()
             e
         )
     })?;
+
+    // 目录可能由旧版本创建，写入前收紧到 Unix 0700，避免私钥目录被其他用户枚举。
+    restrict_cert_dir_permissions(parent)?;
+
+    // 进程号和纳秒时间戳降低并发任务或崩溃残留造成的临时文件名冲突。
+    // 下层仍使用 create_new，最终保证不覆盖同名文件或符号链接。
     let tmp = parent.join(format!(
-        ".{}.{}.tmp",
+        ".{}.{}.{}.tmp",
         path.file_name().and_then(|s| s.to_str()).unwrap_or("cert"),
-        std::process::id()
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
     ));
-    std::fs::write(&tmp, contents.as_ref()).map_err(|e| {
+
+    // 写入、刷盘或失败清理的底层错误由 write_private_cert_temp 保留；这里补充临时路径。
+    write_private_cert_temp(&tmp, contents.as_ref()).map_err(|e| {
         format!(
-            "写入临时文件失败 {} ({})。请检查磁盘空间与写权限",
+            "写入临时文件失败 {} ({})。请检查磁盘空间、写权限或同名残留；不会覆盖已有临时文件",
             tmp.to_string_lossy(),
             e
         )
     })?;
 
+    // Unix 的同目录 rename 可原子覆盖；失败时不能通过删除旧目标来掩盖错误。
+    #[cfg(unix)]
+    return commit_unix_cert_file(&tmp, path);
+
     // Windows 上 rename 不能覆盖已存在目标；先尝试 rename，失败则 remove+rename 再回退 copy。
+    #[cfg(not(unix))]
     match std::fs::rename(&tmp, path) {
         Ok(()) => Ok(()),
         Err(rename_err) => {
@@ -690,15 +728,371 @@ fn write_atomic(path: &std::path::Path, contents: impl AsRef<[u8]>) -> Result<()
     }
 }
 
+// 证书目录可能早已由旧版本创建，写入前仍需收紧目录权限；Windows 不改变既有 ACL。
+fn restrict_cert_dir_permissions(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(path)
+            .map_err(|e| format!("读取证书目录权限失败 {}: {}", path.to_string_lossy(), e))?
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(path, permissions)
+            .map_err(|e| format!("收紧证书目录权限失败 {}: {}", path.to_string_lossy(), e))?;
+    }
+    let _ = path;
+    Ok(())
+}
+
+// 独占创建拒绝已有文件（含符号链接），避免截断残留或跟随链接写到其他位置。
+// Unix 从创建时即使用 0600，rename 后仍保持私有权限；不修改已有文件的权限或内容。
+fn write_private_cert_temp(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    let write_result = file.write_all(contents).and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = write_result {
+        // 写入中途失败时临时文件可能包含部分私钥；清理失败也必须显式返回，不能静默遗留。
+        return match std::fs::remove_file(path) {
+            Ok(()) => Err(error),
+            Err(cleanup_error) => Err(std::io::Error::new(
+                error.kind(),
+                format!("{}；清理临时证书文件失败: {}", error, cleanup_error),
+            )),
+        };
+    }
+    Ok(())
+}
+
+// 失败时保留目标及临时文件，避免二次删除/复制扩大故障；此处只保证单文件替换。
+#[cfg(any(unix, test))]
+fn commit_unix_cert_file(tmp: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
+    std::fs::rename(tmp, path).map_err(|error| format!(
+        "原子写入证书失败 {} ({})；未删除原目标，临时文件保留于 {}",
+        path.to_string_lossy(), error, tmp.to_string_lossy()
+    ))
+}
+
 /// 确保 MITM 证书文件存在且 SAN 版本当前。
-/// `force=true` 时删除旧文件并重新生成（用于「清理并重装」）。
+/// 强制生成由 ensure_mitm_certs_ex(true) 提供，不预先删除旧文件。
 /// 返回 (certs_dir, newly_generated)。
 pub fn ensure_mitm_certs() -> Result<(std::path::PathBuf, bool), String> {
     ensure_mitm_certs_ex(false)
 }
 
+/// 在当前应用配置的 certs 目录准备 CA、私钥、叶子证书链及 SAN 版本标记，不安装系统信任。
+/// `force=false` 时复用通过完整性、版本及文件年龄检查的证书包，否则重新生成；
+/// `force=true` 时跳过复用，但不预删旧文件，避免生成阶段失败就丢失原包。
+/// 返回 `(证书目录, 是否新生成)`；逐文件写入失败会尝试以内存快照恢复，不能覆盖进程崩溃。
+/// 本入口不获取证书任务锁或代理启动占位，调用方须保证桌面进程内互斥且代理已停止。
+/// Unix 上另以配置目录锁文件串行化独立进程的证书包校验和提交。
+/// 委托目录级实现并传入实际生成函数，使测试可使用隔离目录和故障注入。
 pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), String> {
     let certs_dir = crate::commands::config::config_dir_path().join("certs");
+    let _package_lock = acquire_mitm_package_lock(&certs_dir, true)?;
+    ensure_mitm_certs_ex_unlocked(force)
+}
+
+// 调用方须持有包独占锁；供需要把证书提交与后续信任操作纳入同一临界区的流程复用。
+pub(crate) fn ensure_mitm_certs_ex_unlocked(
+    force: bool,
+) -> Result<(std::path::PathBuf, bool), String> {
+    ensure_mitm_certs_in_dir(
+        crate::commands::config::config_dir_path().join("certs"),
+        force,
+        write_mitm_cert_bundle,
+    )
+}
+
+/// 只读校验代理启动所需的现有证书包；后台路径不能隐式生成、轮换或续期证书。
+pub(crate) fn validate_existing_mitm_package() -> Result<std::path::PathBuf, String> {
+    let certs_dir = crate::commands::config::config_dir_path().join("certs");
+    let _package_lock = acquire_mitm_package_lock(&certs_dir, false)?;
+    validate_existing_mitm_package_in_dir(certs_dir)
+}
+
+// 信任安装/卸载与证书写入共享独占锁，避免两个桌面实例交错修改包和信任状态。
+pub(crate) fn acquire_mitm_package_write_lock(
+) -> Result<Option<MitmPackageLock>, String> {
+    acquire_mitm_package_lock(
+        &crate::commands::config::config_dir_path().join("certs"),
+        true,
+    )
+}
+
+// 文件描述符持有期间锁保持有效；Drop 解锁，进程异常退出时由内核释放。
+#[cfg(unix)]
+pub(crate) struct MitmPackageLock(File);
+
+#[cfg(not(unix))]
+pub(crate) struct MitmPackageLock;
+
+#[cfg(unix)]
+impl Drop for MitmPackageLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN); }
+    }
+}
+
+// 锁文件留在配置目录，不能 unlink：已打开旧 inode 的进程与新建路径会形成两把锁。
+#[cfg(unix)]
+pub(crate) fn acquire_mitm_package_lock(
+    certs_dir: &std::path::Path,
+    exclusive: bool,
+) -> Result<Option<MitmPackageLock>, String> {
+    use std::os::fd::AsRawFd;
+    // PermissionsExt 为锁文件收紧到仅当前用户可读写提供 set_mode。
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let lock_root = certs_dir.parent().unwrap_or(certs_dir);
+    if exclusive {
+        std::fs::create_dir_all(lock_root)
+            .map_err(|error| format!("无法创建证书锁目录: {}", error))?;
+    }
+    let lock_path = lock_root.join(".mitm-cert-package.lock");
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lock_path)
+        .map_err(|error| format!("打开证书包互斥锁失败: {}", error))?;
+    let metadata = file.metadata()
+        .map_err(|error| format!("检查证书包互斥锁失败: {}", error))?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return Err("证书包互斥路径必须是单链接普通文件".into());
+    }
+    let mut permissions = metadata.permissions();
+    permissions.set_mode(0o600);
+    file.set_permissions(permissions)
+        .map_err(|error| format!("收紧证书包互斥锁权限失败: {}", error))?;
+    let operation = (if exclusive { libc::LOCK_EX } else { libc::LOCK_SH }) | libc::LOCK_NB;
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            return Err("另一个进程正在校验或修改 MITM 证书包，请稍后重试".into());
+        }
+        return Err(format!("获取证书包互斥锁失败: {}", error));
+    }
+    Ok(Some(MitmPackageLock(file)))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn acquire_mitm_package_lock(
+    _certs_dir: &std::path::Path,
+    _exclusive: bool,
+) -> Result<Option<MitmPackageLock>, String> {
+    Ok(None)
+}
+
+// 独立目录参数便于在临时目录测试；此函数只读取和校验，不创建目录或修复文件。
+fn validate_existing_mitm_package_in_dir(
+    certs_dir: std::path::PathBuf,
+) -> Result<std::path::PathBuf, String> {
+    reject_interrupted_mitm_candidates(&certs_dir)?;
+    let ca_cert = certs_dir.join("server.codeium.com.pem");
+    let ca_key = certs_dir.join("server.codeium.com-key.pem");
+    let leaf_cert = certs_dir.join(MITM_LEAF_CERT_FILE);
+    let leaf_key = certs_dir.join(MITM_LEAF_KEY_FILE);
+    let san_marker = certs_dir.join("san-version");
+
+    // 先分别校验 CA/叶子公私钥，再校验版本、签名链和有效期，整个过程不修改证书包。
+    validate_mitm_cert_files(&ca_cert, &ca_key)
+        .map_err(|error| format!("现有 MITM CA 无效: {}", error))?;
+    validate_mitm_cert_files(&leaf_cert, &leaf_key)
+        .map_err(|error| format!("现有 MITM 叶子证书无效: {}", error))?;
+    let marker = std::fs::read_to_string(&san_marker)
+        .map_err(|error| format!("读取现有证书 SAN 版本失败: {}", error))?;
+    if marker.trim() != MITM_CERT_SAN_VERSION {
+        return Err(format!(
+            "现有证书 SAN 版本过期（当前要求 {}），请在环境检测中显式生成/重装证书",
+            MITM_CERT_SAN_VERSION
+        ));
+    }
+    validate_mitm_candidate_chain(&certs_dir)
+        .map_err(|error| format!("现有 MITM 证书链无效: {}", error))?;
+    if mitm_certs_need_renewal(&certs_dir) {
+        return Err("现有 MITM 证书已到续期窗口，请在环境检测中显式生成/重装证书".into());
+    }
+    Ok(certs_dir)
+}
+
+// 只读检测候选目录，阻止代理复用或信任安装使用可能正在生成/提交的证书包。
+// 残留也可能属于其他进程；不自动删除候选目录或恢复文件，避免破坏并发操作。
+pub(crate) fn reject_interrupted_mitm_candidates(certs_dir: &std::path::Path) -> Result<(), String> {
+    let entries = match std::fs::read_dir(certs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("读取证书目录失败，拒绝使用现有证书包: {}", error)),
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("检查证书目录失败，拒绝使用现有证书包: {}", error))?;
+        if entry.file_name().to_string_lossy().starts_with(".candidate-") {
+            return Err(format!(
+                "发现候选证书目录 {}，可能有证书生成/提交仍在进行或曾中断；代理未启动。等待相关操作结束后重试；若目录持续存在，请人工核查，程序不会自动删除",
+                entry.path().display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+// 仅离线验证候选链，不安装或读取系统信任；根来自候选 CA 而非链中任意证书。
+// WebPKI 校验叶子有效期、服务端用途和签名链；信任锚本身的有效期/自签名需另行检查。
+pub(crate) fn validate_mitm_candidate_chain(dir: &std::path::Path) -> Result<(), String> {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName, UnixTime};
+    let read_chain = |name: &str| -> Result<Vec<CertificateDer<'static>>, String> {
+        let pem = std::fs::read(dir.join(name)).map_err(|e| e.to_string())?;
+        CertificateDer::pem_slice_iter(&pem).collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    };
+    let ca = read_chain("server.codeium.com.pem")?;
+    if ca.len() != 1 {
+        return Err("候选 CA 必须恰好包含一张证书".into());
+    }
+    let chain = read_chain(MITM_LEAF_CERT_FILE)?;
+    if chain.len() != 2 || chain[1] != ca[0] {
+        return Err("候选叶子链必须为叶子证书加当前候选 CA".into());
+    }
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca[0].clone()).map_err(|e| e.to_string())?;
+    let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+        std::sync::Arc::new(roots),
+        std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+    ).build().map_err(|e| e.to_string())?;
+    let now = UnixTime::now();
+    for hostname in mitm_dns_names() {
+        let name = ServerName::try_from(*hostname).map_err(|e| e.to_string())?;
+        verifier.verify_server_cert(&chain[0], &[], &name, &[], now)
+            .map_err(|e| format!("候选 TLS 证书链校验失败（{}）: {}", hostname, e))?;
+    }
+    Ok(())
+}
+
+// 在逐文件提交前保存完整快照；提交失败时逆序恢复，避免 CA、私钥和叶子文件混合。
+// 这是进程内故障恢复，不等同于跨进程崩溃安全的事务；恢复失败必须停机报告。
+fn commit_mitm_package<F>(
+    certs_dir: &std::path::Path,
+    files: &[&str],
+    contents: &[Vec<u8>],
+    mut write_file: F,
+) -> Result<(), String>
+where
+    F: FnMut(&std::path::Path, &[u8]) -> Result<(), String>,
+{
+    if files.len() != contents.len() {
+        return Err("证书包文件与内容数量不一致，未提交".into());
+    }
+    let snapshot = files.iter().map(|name| {
+        let path = certs_dir.join(name);
+        // 不把符号链接或目录当成可恢复的普通文件；在首次提交前拒绝异常目标。
+        match std::fs::symlink_metadata(&path) {
+            Ok(metadata) if !metadata.file_type().is_file() => {
+                return Err(format!("证书目标不是普通文件，未提交: {}", path.display()));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(format!("读取证书目标失败 {}: {}", path.display(), error)),
+        }
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(format!("读取证书包快照失败 {}: {}", path.display(), error)),
+        }
+    }).collect::<Result<Vec<_>, _>>()?;
+
+    let mut committed = 0usize;
+    for (name, content) in files.iter().zip(contents) {
+        if let Err(error) = write_file(&certs_dir.join(name), content) {
+            let mut rollback_errors = Vec::new();
+            // 写入返回错误时目标也可能已被改动，因此连失败的当前文件一起恢复。
+            for (rollback_name, previous) in files[..=committed].iter().zip(&snapshot[..=committed]).rev() {
+                let path = certs_dir.join(rollback_name);
+                let result = match previous {
+                    Some(bytes) => write_file(&path, bytes),
+                    None => match std::fs::remove_file(&path) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(e.to_string()),
+                    },
+                };
+                if let Err(rollback_error) = result {
+                    rollback_errors.push(format!("{}: {}", path.display(), rollback_error));
+                }
+            }
+            return if rollback_errors.is_empty() {
+                Err(format!("证书包提交失败，已恢复原包: {}", error))
+            } else {
+                Err(format!("证书包提交失败且恢复失败，当前状态不确定，请停机并人工恢复: {}; {}", error, rollback_errors.join("; ")))
+            };
+        }
+        committed += 1;
+    }
+    Ok(())
+}
+
+// 候选目录独占创建，Unix 从创建时即为 0700；不会复用或清理其他任务的目录。
+fn prepare_mitm_candidate(
+    certs_dir: &std::path::Path,
+    write_bundle: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    restrict_cert_dir_permissions(certs_dir)?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?.as_nanos();
+    let candidate = certs_dir.join(format!(".candidate-{}-{stamp}", std::process::id()));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+
+    builder.create(&candidate).map_err(|e| format!("创建候选证书目录失败: {}", e))?;
+    let result: Result<(), String> = (|| {
+        write_bundle(&candidate)?;
+        validate_mitm_cert_files(&candidate.join("server.codeium.com.pem"), &candidate.join("server.codeium.com-key.pem"))?;
+        validate_mitm_cert_files(&candidate.join(MITM_LEAF_CERT_FILE), &candidate.join(MITM_LEAF_KEY_FILE))?;
+        validate_mitm_candidate_chain(&candidate)?;
+        let marker = std::fs::read_to_string(candidate.join("san-version")).map_err(|e| e.to_string())?;
+        if marker.trim() != MITM_CERT_SAN_VERSION {
+            return Err("候选证书 SAN 版本标记无效".into());
+        }
+
+        // 先读齐整个候选包，任何生成、校验或读取错误都不会修改当前包。
+        // 提交仍逐文件执行；写入错误触发内存快照恢复，但崩溃、信任/代理失败不在恢复范围。
+        let files = ["server.codeium.com.pem", "server.codeium.com-key.pem",
+            MITM_LEAF_CERT_FILE, MITM_LEAF_KEY_FILE, "san-version"];
+        let contents = files.iter().map(|name| {
+            std::fs::read(candidate.join(name)).map_err(|e| e.to_string())
+        }).collect::<Result<Vec<_>, _>>()?;
+        commit_mitm_package(certs_dir, &files, &contents, |path, bytes| write_atomic(path, bytes))
+    })();
+
+    // 只清理本次成功创建的候选目录；清理失败显式报告，私钥不能静默遗留。
+    match (result, std::fs::remove_dir_all(&candidate)) {
+        (result, Ok(())) => result,
+        (result, Err(error)) => Err(format!("{}；候选目录清理失败 {}: {}（可能含私钥，请勿上传）",
+            result.err().unwrap_or_else(|| "证书文件已提交".into()), candidate.display(), error)),
+    }
+}
+
+// 注入生成步骤以隔离测试目录及失败路径；不触碰真实配置目录或系统信任库。
+fn ensure_mitm_certs_in_dir(
+    certs_dir: std::path::PathBuf,
+    force: bool,
+    write_bundle: impl FnOnce(&std::path::Path) -> Result<(), String>,
+) -> Result<(std::path::PathBuf, bool), String> {
     std::fs::create_dir_all(&certs_dir).map_err(|e| {
         format!(
             "无法创建证书目录 {} ({})。请检查用户配置目录写权限",
@@ -706,6 +1100,7 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
             e
         )
     })?;
+    reject_interrupted_mitm_candidates(&certs_dir)?;
 
     let cert_path = certs_dir.join("server.codeium.com.pem");
     let key_path = certs_dir.join("server.codeium.com-key.pem");
@@ -713,13 +1108,8 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
     let leaf_key_path = certs_dir.join(MITM_LEAF_KEY_FILE);
     let san_marker_path = certs_dir.join("san-version");
 
-    if force {
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
-        let _ = std::fs::remove_file(&leaf_cert_path);
-        let _ = std::fs::remove_file(&leaf_key_path);
-        let _ = std::fs::remove_file(&san_marker_path);
-    }
+    // force 只跳过复用判断，不预删旧包；候选生成失败不会改变当前包。
+    // 提交写入错误会尝试快照恢复；崩溃及后续信任安装/代理失败不属于该恢复边界。
 
     let cert_ok = cert_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let key_ok = key_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
@@ -736,18 +1126,26 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
         .map(|s| s.trim() == MITM_CERT_SAN_VERSION)
         .unwrap_or(false);
     let contents_ok = cert_ok && key_ok && validate_mitm_cert_files(&cert_path, &key_path).is_ok();
+
     // 证书现在有有效期（365 天），到期后客户端会重新按策略拒绝 → 必须提前换新。
     // 用「文件生成时间」判断是否该换（阈值 300 天 < 365 天有效期），无需额外 X.509 解析依赖：
     // 只要用户每 365 天启动过一次，就不会拿到过期证书；久未启动则下次启动自动换新。
     let fresh_enough = !mitm_certs_need_renewal(&certs_dir);
+
     // CA 与叶子证书必须成对且完整；任一空/缺/版本过期/内容无效/快到期都重生。
     // 旧版只有 CA-as-leaf 单文件（无 mitm-leaf.pem）→ leaf_ok=false → 自动补齐叶子证书。
+    // 对可解析旧包也验证实际链和域名；失败只报错，不因新校验失败静默轮换 CA。
+    if !force && contents_ok && san_ok && leaf_ok {
+        validate_mitm_candidate_chain(&certs_dir).map_err(|e| format!(
+            "现有证书包离线校验失败，未自动替换证书。请检查系统时间和证书包，停止代理后显式处理: {}", e
+        ))?;
+    }
     let already_complete = !force && contents_ok && san_ok && leaf_ok && fresh_enough;
 
     if !already_complete {
         // 生成 CA 信任根 + 由其签发的 end-entity 叶子证书。
         // 严格 TLS 客户端（rustls/webpki）拒绝 CA 证书当作服务器证书，故叶子必须独立。
-        write_mitm_cert_bundle(&certs_dir)?;
+        prepare_mitm_candidate(&certs_dir, write_bundle)?;
 
         // 回读校验：避免磁盘满/权限问题导致「写入成功但文件为空」
         let cert_ok = cert_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
@@ -763,8 +1161,12 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
         let san_ok = std::fs::read_to_string(&san_marker_path)
             .map(|s| s.trim() == MITM_CERT_SAN_VERSION)
             .unwrap_or(false);
+
+        // 提交后再次从当前路径读链，避免只验证候选目录却漏掉目标包不一致。
         let contents_result = validate_mitm_cert_files(&cert_path, &key_path)
-            .and_then(|()| validate_mitm_cert_files(&leaf_cert_path, &leaf_key_path));
+            .and_then(|()| validate_mitm_cert_files(&leaf_cert_path, &leaf_key_path))
+            .and_then(|()| validate_mitm_candidate_chain(&certs_dir));
+
         if !cert_ok || !key_ok || !leaf_ok || !san_ok || contents_result.is_err() {
             return Err(format!(
                 "证书写入后校验失败: cert_ok={} key_ok={} leaf_ok={} san_ok={} contents={} dir={}",
@@ -781,26 +1183,33 @@ pub fn ensure_mitm_certs_ex(force: bool) -> Result<(std::path::PathBuf, bool), S
     Ok((certs_dir, !already_complete))
 }
 
+/// 与安装/卸载共用任务锁，并在生成及信任安装期间阻止桌面代理启动。
+/// 超时只结束等待，阻塞任务实际退出前仍保留保护；不主动停止运行中的代理。
 #[tauri::command]
-pub async fn generate_certs() -> Result<String, String> {
-    let handle = tauri::async_runtime::spawn_blocking(|| generate_certs_ex(false));
-    match tokio::time::timeout(std::time::Duration::from_secs(60), handle).await {
-        Ok(join) => join.map_err(|e| format!("证书生成任务失败: {}", e))?,
-        Err(_) => {
-            Err("证书生成超时（60s）。请重试；若仍失败请到「环境检测」点「清理并重装」".into())
-        }
-    }
+pub async fn generate_certs(app: AppHandle, request_id: Option<String>) -> Result<String, String> {
+    // 与其他健康页证书动作共用包装器，使进度事件能关联同一个 UI 请求和后端操作。
+    crate::commands::cert_install::run_cert_task("证书生成", Some(app.clone()), request_id, move || {
+        crate::commands::proxy::with_proxy_stopped(&app, || generate_certs_ex(false))
+    }).await
 }
 
-/// 生成（或强制重生）MITM 证书，并尝试安装到系统信任库。
-/// 走提权安装 LocalMachine\Root（UAC 授权后静默，无 Windows 安全警告）；
-/// 提权失败再降级 CurrentUser\Root。
+/// 生成（或强制重生）MITM 证书，并尝试安装到当前平台的系统信任库。
+/// Unix 上的包写锁覆盖证书提交和信任安装，避免独立桌面实例在两步之间轮换 CA。
+/// 信任安装失败会作为错误返回；已写入的证书文件不会被误报为完整成功。
+/// 本函数不获取进程内证书任务锁或代理启动占位，调用方负责这些保护。
 pub fn generate_certs_ex(force: bool) -> Result<String, String> {
-    let (certs_dir, generated) = ensure_mitm_certs_ex(force)?;
+    let certs_dir = crate::commands::config::config_dir_path().join("certs");
+    let _package_lock = acquire_mitm_package_lock(&certs_dir, true)?;
+    let (certs_dir, generated) = ensure_mitm_certs_ex_unlocked(force)?;
 
-    // 提权装 LocalMachine\Root：UAC 授权后静默安装，不弹 Windows「安全警告」。
-    // 「生成证书」是用户显式操作，弹 UAC 提权符合预期。
-    match crate::commands::cert_install::install_ca_with_options(false, force || generated) {
+    // 生成入口是用户显式操作，允许当前平台的信任安装流程请求必要授权；
+    // 具体平台实现负责保留原始授权错误，不在后台绕过系统安全边界。
+    match crate::commands::cert_install::install_ca_impl_with_package_lock(
+        None,
+        false,
+        force || generated,
+        true,
+    ) {
         Ok(install_msg) => {
             let gen_msg = if generated {
                 format!("已生成证书到 {}", certs_dir.to_string_lossy())
@@ -813,10 +1222,10 @@ pub fn generate_certs_ex(force: bool) -> Result<String, String> {
             let gen_msg = if generated {
                 format!("已生成证书到 {}", certs_dir.to_string_lossy())
             } else {
-                format!("证书已存在 ({})", certs_dir.to_string_lossy())
+                format!("证书文件已就绪 ({})", certs_dir.to_string_lossy())
             };
-            Ok(format!(
-                "{}。⚠ 自动安装到系统信任库未完成: {}。请在「平台 > 设置 > 环境检测」点「安装证书」或「清理并重装」",
+            Err(format!(
+                "{}，但系统信任安装未完成: {}。请在「平台 > 设置 > 环境检测」点「安装证书」；不要反复重生证书",
                 gen_msg, e
             ))
         }
@@ -1464,6 +1873,7 @@ pub fn set_windsurf_path(path: String) -> Result<(), String> {
 
 /// 沙箱兼容标记：记录某平台因 Chromium 沙箱初始化失败而需要 --no-sandbox 启动。
 /// 存储于应用数据目录的 sandbox_compat.json，按平台 ID 记录布尔值。
+#[cfg(target_os = "windows")]
 fn sandbox_compat_flag(platform: &str) -> bool {
     if let Some(dir) = dirs::data_dir() {
         let p = dir.join("AnyBridge").join("sandbox_compat.json");
@@ -1476,6 +1886,7 @@ fn sandbox_compat_flag(platform: &str) -> bool {
     false
 }
 
+#[cfg(target_os = "windows")]
 fn set_sandbox_compat_flag(platform: &str, enabled: bool) {
     if let Some(dir) = dirs::data_dir() {
         let dir = dir.join("AnyBridge");
@@ -2154,7 +2565,6 @@ pub fn detect_target_ide() -> String {
     #[cfg(target_os = "macos")]
     {
         use std::path::PathBuf;
-        let config_dir = dirs::config_dir().unwrap_or_else(|| PathBuf::from("."));
         // macOS: Windsurf/Devin 配置在 ~/Library/Application Support/
         let support_dir = dirs::data_dir().unwrap_or_else(|| PathBuf::from("."));
 
@@ -2255,6 +2665,18 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    // 每项证书测试使用独立临时目录，避免并发测试读写同一路径。
+    fn unique_temp_dir() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "anybridge-system-test-{}-{stamp}",
+            std::process::id()
+        ))
+    }
+
     #[test]
     fn mitm_dns_names_include_cursor_hosts_without_duplicates() {
         let names = mitm_dns_names();
@@ -2278,17 +2700,357 @@ mod tests {
         assert_eq!(MITM_CERT_SAN_VERSION, "3");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn package_lock_allows_shared_readers_and_rejects_writers() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = unique_temp_dir();
+        let certs_dir = dir.join("certs");
+        std::fs::create_dir_all(&certs_dir).unwrap();
+        let read_lock = acquire_mitm_package_lock(&certs_dir, false).unwrap();
+        let second_reader = acquire_mitm_package_lock(&certs_dir, false).unwrap();
+        let writer = acquire_mitm_package_lock(&certs_dir, true);
+        assert!(writer.is_err());
+        drop(second_reader);
+        drop(read_lock);
+        let writer = acquire_mitm_package_lock(&certs_dir, true).unwrap();
+        let mode = std::fs::metadata(dir.join(".mitm-cert-package.lock"))
+            .unwrap().permissions().mode();
+        drop(writer);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn certificate_directory_permissions_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-cert-dir-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut permissions = std::fs::metadata(&dir).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&dir, permissions).unwrap();
+        restrict_cert_dir_permissions(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
+    #[test]
+    fn private_cert_temp_write_failure_does_not_leave_partial_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-private-cleanup-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let temp = dir.join("missing-parent").join("key.tmp");
+        // 父目录不存在，稳定触发创建失败且不依赖权限环境；不会产生临时文件。
+        let result = write_private_cert_temp(&temp, b"private-key");
+        let exists = temp.exists();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+        assert!(!exists, "临时私钥写入失败后不能留下部分文件");
+    }
+
+    #[test]
+    fn private_cert_temp_refuses_existing_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-private-temp-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let temp = dir.join("key.tmp");
+        write_private_cert_temp(&temp, b"original").unwrap();
+        let result = write_private_cert_temp(&temp, b"replacement");
+        let actual = std::fs::read(&temp).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(actual, b"original");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_cert_temp_rejects_symlink_and_has_private_permissions() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-private-link-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("key.pem");
+        write_private_cert_temp(&target, b"original").unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        let link = dir.join("key.tmp");
+        symlink(&target, &link).unwrap();
+        let result = write_private_cert_temp(&link, b"replacement");
+        let actual = std::fs::read(&target).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+        assert_eq!(actual, b"original");
+        assert_eq!(mode & 0o077, 0, "私钥不能授予组或其他用户访问权限");
+    }
+
+    #[test]
+    fn failed_unix_commit_preserves_existing_target() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-commit-failure-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("certificate.pem");
+        std::fs::write(&target, b"original").unwrap();
+        // 缺失源文件可稳定模拟 rename 失败，不依赖权限设置或以管理员身份运行与否。
+        let result = commit_unix_cert_file(&dir.join("missing.tmp"), &target);
+        let preserved = std::fs::read(&target).ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_err());
+        assert_eq!(preserved.as_deref(), Some(b"original".as_slice()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_atomic_write_replaces_existing_target() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-commit-success-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("certificate.pem");
+        std::fs::write(&target, b"original").unwrap();
+        let result = write_atomic(&target, b"replacement");
+        let actual = std::fs::read(&target).ok();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(result.is_ok());
+        assert_eq!(actual.as_deref(), Some(b"replacement".as_slice()));
+    }
+
+    #[test]
+    fn forced_generation_failure_preserves_existing_bundle() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-force-failure-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        let files = ["server.codeium.com.pem", "server.codeium.com-key.pem",
+            MITM_LEAF_CERT_FILE, MITM_LEAF_KEY_FILE, "san-version"];
+        for name in files {
+            std::fs::write(dir.join(name), format!("original-{name}")).unwrap();
+        }
+        // 模拟写出部分候选私钥后失败，验证当前包不受影响且候选目录被清理。
+        let result = ensure_mitm_certs_in_dir(dir.clone(), true, |candidate| {
+            assert_ne!(candidate, dir.as_path());
+            write_atomic(&candidate.join("server.codeium.com-key.pem"), b"partial-key")?;
+            Err("generation failed".into())
+        });
+        assert_eq!(result.unwrap_err(), "generation failed");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), files.len());
+        let preserved = files.iter().all(|name| {
+            std::fs::read(dir.join(name)).ok() == Some(format!("original-{name}").into_bytes())
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(preserved, "生成失败不能预先删除旧证书包");
+    }
+
+    #[test]
+    fn certificate_key_pair_rejects_valid_but_unrelated_key() {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let other_key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap().pem();
+        assert!(validate_mitm_key_pair(cert.as_bytes(), key.serialize_pem().as_bytes()).is_ok());
+        assert!(validate_mitm_key_pair(cert.as_bytes(), other_key.serialize_pem().as_bytes()).is_err());
+        assert!(validate_mitm_key_pair(b"", key.serialize_pem().as_bytes()).is_err());
+    }
+
+    #[test]
+    fn candidate_chain_rejects_unrelated_ca() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-chain-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        write_mitm_cert_bundle(&dir).unwrap();
+        assert!(validate_mitm_candidate_chain(&dir).is_ok());
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let wrong_ca = params.self_signed(&key).unwrap().pem();
+        write_atomic(&dir.join("server.codeium.com.pem"), &wrong_ca).unwrap();
+        assert!(validate_mitm_candidate_chain(&dir).is_err());
+        // 将链尾也换成同一个错误根，确保不是仅靠 PEM 链尾相等判断通过。
+        use rustls::pki_types::{pem::PemObject, CertificateDer};
+        let pem = std::fs::read(dir.join(MITM_LEAF_CERT_FILE)).unwrap();
+        let leaf = CertificateDer::from_pem_slice(&pem).unwrap();
+        use base64::Engine;
+        let leaf_pem = format!("-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n{}",
+            base64::engine::general_purpose::STANDARD.encode(leaf.as_ref()), wrong_ca);
+        write_atomic(&dir.join(MITM_LEAF_CERT_FILE), leaf_pem).unwrap();
+        assert!(validate_mitm_candidate_chain(&dir).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mixed_existing_bundle_is_rejected_without_rotation() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-mixed-{}-{stamp}", std::process::id()));
+        let other = dir.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        write_mitm_cert_bundle(&dir).unwrap();
+        write_mitm_cert_bundle(&other).unwrap();
+        // 每对密钥均有效，但叶子来自另一套 CA，模拟逐文件提交中断的混合包。
+        for name in [MITM_LEAF_CERT_FILE, MITM_LEAF_KEY_FILE] {
+            write_atomic(&dir.join(name), std::fs::read(other.join(name)).unwrap()).unwrap();
+        }
+        let ca_before = std::fs::read(dir.join("server.codeium.com.pem")).unwrap();
+        let leaf_before = std::fs::read(dir.join(MITM_LEAF_CERT_FILE)).unwrap();
+        let result = ensure_mitm_certs_in_dir(dir.clone(), false, |_| {
+            panic!("链校验失败不得触发自动轮换");
+        });
+        assert!(result.unwrap_err().contains("未自动替换证书"));
+        assert_eq!(std::fs::read(dir.join("server.codeium.com.pem")).unwrap(), ca_before);
+        assert_eq!(std::fs::read(dir.join(MITM_LEAF_CERT_FILE)).unwrap(), leaf_before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // 注入写后报错，覆盖失败目标也须恢复、原本不存在的文件须移除；不接触真实证书库。
+    #[test]
+    fn package_commit_restores_existing_and_absent_files() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-rollback-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&dir).unwrap();
+        for failure in 0..3 {
+            write_atomic(&dir.join("old"), b"original").unwrap();
+            let mut calls = 0;
+            let result = commit_mitm_package(&dir, &["old", "new", "last"],
+                &[b"changed".to_vec(), b"new".to_vec(), b"last".to_vec()], |path, bytes| {
+                    write_atomic(path, bytes)?;
+                    let fail = calls == failure;
+                    calls += 1;
+                    if fail { Err("injected commit failure".into()) } else { Ok(()) }
+                });
+            assert!(result.unwrap_err().contains("已恢复原包"));
+            assert_eq!(std::fs::read(dir.join("old")).unwrap(), b"original");
+            assert!(!dir.join("new").exists());
+            assert!(!dir.join("last").exists());
+        }
+        let result = commit_mitm_package(&dir, &["old"], &[b"changed".to_vec()], |_, _| {
+            Err("injected persistent failure".into())
+        });
+        assert!(result.unwrap_err().contains("当前状态不确定"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn candidate_bundle_commits_and_is_cleaned_up() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("anybridge-candidate-{}-{stamp}", std::process::id()));
+        let result = ensure_mitm_certs_in_dir(dir.clone(), true, write_mitm_cert_bundle);
+        assert!(result.unwrap().1);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 5);
+        assert!(!ensure_mitm_certs_in_dir(dir.clone(), false, |_| {
+            panic!("有效证书包应该复用");
+        }).unwrap().1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // 候选目录可能对应仍在运行的其他生成任务；只读校验保留目录并拒绝并行复用。
+    #[test]
+    fn candidate_directory_blocks_background_validation_without_cleanup() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join(".candidate-123-456");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("server.codeium.com-key.pem"), b"private-key-fragment").unwrap();
+
+        let result = validate_existing_mitm_package_in_dir(dir.clone());
+        let blocked = result.is_err_and(|error| error.contains("候选证书目录"));
+        let preserved = std::fs::read(candidate.join("server.codeium.com-key.pem"))
+            .is_ok_and(|bytes| bytes == b"private-key-fragment");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(blocked, "残留候选目录必须阻止后台复用");
+        assert!(preserved, "只读检查不得删除候选私钥片段");
+    }
+
+    // 候选目录存在时，显式生成也必须停止，避免在不确定包状态上继续轮换。
+    #[test]
+    fn candidate_directory_blocks_generation_without_cleanup() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let candidate = dir.join(".candidate-123-456");
+        std::fs::create_dir(&candidate).unwrap();
+        std::fs::write(candidate.join("server.codeium.com-key.pem"), b"private-key-fragment").unwrap();
+
+        let result = ensure_mitm_certs_in_dir(dir.clone(), true, |_| {
+            panic!("候选目录存在时不能调用生成器");
+        });
+        let blocked = result.is_err_and(|error| error.contains("候选证书目录"));
+        let preserved = std::fs::read(candidate.join("server.codeium.com-key.pem"))
+            .is_ok_and(|bytes| bytes == b"private-key-fragment");
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(blocked, "候选目录必须阻止新生成");
+        assert!(preserved, "拒绝生成时不得删除候选内容");
+    }
+
+    // 空目录应只返回错误且保持为空，避免后台校验退化为隐式生成。
+    #[test]
+    fn background_package_validation_never_generates_or_changes_files() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let result = validate_existing_mitm_package_in_dir(dir.clone());
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // 仅在临时目录生成测试证书；不访问系统信任库或真实用户配置。
+    #[test]
+    fn background_package_validation_accepts_only_a_current_complete_bundle() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        write_mitm_cert_bundle(&dir).unwrap();
+        assert_eq!(validate_existing_mitm_package_in_dir(dir.clone()).unwrap(), dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // SAN 版本过旧时后台只能拒绝；不能趁校验失败悄悄轮换当前受信任的 CA。
+    #[test]
+    fn stale_san_marker_is_rejected_without_changing_the_package() {
+        let dir = unique_temp_dir();
+        std::fs::create_dir(&dir).unwrap();
+        write_mitm_cert_bundle(&dir).unwrap();
+        std::fs::write(dir.join("san-version"), "stale").unwrap();
+        let names = [
+            "server.codeium.com.pem",
+            "server.codeium.com-key.pem",
+            MITM_LEAF_CERT_FILE,
+            MITM_LEAF_KEY_FILE,
+            "san-version",
+        ];
+        let before = names
+            .iter()
+            .map(|name| (*name, std::fs::read(dir.join(name)).unwrap()))
+            .collect::<Vec<_>>();
+
+        let result = validate_existing_mitm_package_in_dir(dir.clone());
+        let after = names
+            .iter()
+            .map(|name| std::fs::read(dir.join(name)).map(|bytes| (*name, bytes)))
+            .collect::<Result<Vec<_>, _>>();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        assert!(result.unwrap_err().contains("SAN 版本过期"));
+        assert_eq!(after.unwrap(), before);
+    }
+
     #[test]
     fn freshly_generated_certs_do_not_need_renewal() {
-        let dir = std::env::temp_dir().join("anybridge-cert-renewal-check");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_temp_dir();
+        std::fs::create_dir(&dir).unwrap();
         write_mitm_cert_bundle_for_test(&dir).unwrap();
+        let needs_renewal = mitm_certs_need_renewal(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
         assert!(
-            !mitm_certs_need_renewal(&dir),
+            !needs_renewal,
             "刚生成的证书不能被判定为需要换新，否则每次启动都会重装信任库"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

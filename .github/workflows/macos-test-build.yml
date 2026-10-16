@@ -1,0 +1,150 @@
+name: macOS 测试构建
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - "test/**"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: 测试安装包（${{ matrix.target }}）
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    env:
+      RUST_TARGET: ${{ matrix.target }}
+      NO_STRIP: "true"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            sidecar/package-lock.json
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: 验证原生构建工具链
+        run: |
+          set -euo pipefail
+          xcrun --find clang
+          xcrun --show-sdk-path
+          HOST="$(rustc -vV | awk '/^host: / {print $2}')"
+          test "$HOST" = "$RUST_TARGET"
+
+      - name: 安装依赖
+        run: |
+          npm ci
+          npm ci --prefix sidecar
+
+      - name: 检查界面与健康检测行为
+        run: |
+          npm run build:ui
+          npm run check:ui
+          node --test scripts/test-healthcheck.mjs
+
+      - name: 构建外部二进制组件
+        run: |
+          set -euo pipefail
+          python scripts/build/build_sidecar_plain.py --platform "$RUST_TARGET"
+          python scripts/build/build_cursor_core.py --target "$RUST_TARGET"
+          test -s "src-tauri/binaries/anybridge-proxy-$RUST_TARGET"
+          test -s "src-tauri/binaries/anybridge-cursor-core-$RUST_TARGET"
+
+      - name: 构建本地测试包（不生成更新器产物）
+        run: node scripts/build/tauri_build.mjs --config src-tauri/tauri.local.conf.json --target "$RUST_TARGET" --bundles app,dmg
+
+      - name: 标记测试磁盘映像文件
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          images=("src-tauri/target/$RUST_TARGET/release/bundle/dmg/"*.dmg)
+          test "${#images[@]}" -eq 1
+          mv "${images[0]}" "${images[0]%.dmg}_test.dmg"
+
+      - name: 验证应用包与 Sidecar JIT 权限
+        run: |
+          set -euo pipefail
+          APP="src-tauri/target/$RUST_TARGET/release/bundle/macos/AnyBridge.app"
+          SIDECAR="$APP/Contents/MacOS/anybridge-proxy"
+          test -s "$SIDECAR"
+          test -s "$APP/Contents/MacOS/anybridge-cursor-core"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$SIDECAR" 2>&1 | tee "$RUNNER_TEMP/sidecar-flags.txt"
+          grep -Eq 'flags=0x[0-9a-f]+\([^)]*runtime' "$RUNNER_TEMP/sidecar-flags.txt"
+          codesign -d --entitlements :- "$SIDECAR" > "$RUNNER_TEMP/sidecar-entitlements.plist" 2>/dev/null
+          python - <<'PY'
+          import os
+          import plistlib
+          from pathlib import Path
+          entitlements = plistlib.loads((Path(os.environ['RUNNER_TEMP']) / 'sidecar-entitlements.plist').read_bytes())
+          required = ['com.apple.security.cs.allow-jit', 'com.apple.security.cs.allow-unsigned-executable-memory']
+          missing = [key for key in required if entitlements.get(key) is not True]
+          if missing:
+              raise SystemExit(f'缺少 JIT 权限配置：{missing}')
+          PY
+
+      - name: 隔离进程冒烟测试（不验证 TLS）
+        run: |
+          python - <<'PY'
+          import os
+          import socket
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          binary = Path('src-tauri/target') / os.environ['RUST_TARGET'] / 'release/bundle/macos/AnyBridge.app/Contents/MacOS/anybridge-proxy'
+          ports = {'API_PORT': '17450', 'INFERENCE_PORT': '17451', 'ANTIGRAVITY_HTTPS_PORT': '17452'}
+          for port in ports.values():
+              with socket.socket() as probe:
+                  probe.bind(('127.0.0.1', int(port)))
+          with tempfile.TemporaryDirectory(prefix='anybridge-smoke-') as config:
+              env = dict(os.environ, **ports, BYOK_CONFIG_DIR=config)
+              with tempfile.TemporaryFile() as output:
+                  process = subprocess.Popen([str(binary.resolve())], env=env, stdout=output, stderr=subprocess.STDOUT)
+                  try:
+                      try:
+                          code = process.wait(timeout=5)
+                      except subprocess.TimeoutExpired:
+                          print('Sidecar 已持续运行 5 秒；本测试不验证 TLS 和 Keychain。')
+                      else:
+                          raise SystemExit(f'Sidecar 提前退出，退出码：{code}')
+                  finally:
+                      if process.poll() is None:
+                          process.terminate()
+                          try:
+                              process.wait(timeout=10)
+                          except subprocess.TimeoutExpired:
+                              process.kill()
+                              process.wait()
+          PY
+
+      - name: 上传测试磁盘映像
+        uses: actions/upload-artifact@v6
+        with:
+          name: AnyBridge-测试包-${{ matrix.target }}-${{ github.sha }}
+          path: src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*_test.dmg
+          if-no-files-found: error
+          retention-days: 14

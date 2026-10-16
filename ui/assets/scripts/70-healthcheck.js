@@ -11,7 +11,9 @@
 (function () {
   let _lastReport = null;
   let _certInstallProgressUnlisten = null;
-  let _lastCertProgressMessage = '';
+  let _activeCertOperationId = null;
+  let _completedCertOperationIds = new Set();
+  let _certProgressMessageKeys = new Set();
 
   // ── 上下文感知的元素查找 ──
   // 当用户在「平台 → 设置 → 环境检测」面板操作时，getElementById 会找到
@@ -51,7 +53,8 @@
       _lastReport = report;
       renderGroupedReport(report);
       enableExportButtons(true);
-      addLog && addLog('ok', `环境检测: 完成 (${report.totals.err} 错误 / ${report.totals.warn} 警告 / ${report.totals.ok} 通过)`);
+      // 完成仅表示报告已返回；按错误优先、警告其次分级，不能一律记录为成功。
+      addLog && addLog(report.totals.err > 0 ? 'err' : report.totals.warn > 0 ? 'warn' : 'ok', `环境检测: 完成 (${report.totals.err} 错误 / ${report.totals.warn} 警告 / ${report.totals.ok} 通过)`);
     } catch (e) {
       setHealthSummary('检测失败: ' + escapeHtml(String(e)), 'err');
       addLog && addLog('err', '环境检测执行失败: ' + e);
@@ -86,7 +89,7 @@
     setCertInstallProgress({ message: '正在生成 MITM 证书', percent: 10, level: 'info' });
     addLog && addLog('ok', '正在生成 MITM 证书...');
     try {
-      const msg = await invoke('generate_certs');
+      const msg = await invokeCertTask('generate_certs');
       setCertInstallProgress({ message: msg || '证书已生成', percent: 100, level: 'ok' });
       addLog && addLog('ok', '证书生成: ' + msg);
       await window.runHealthcheck();
@@ -104,7 +107,7 @@
 
   // ──────────────────────────────────────────────
   // 入口：用户点「一键安装证书」按钮
-  // 后端 install_ca 已经做了"CurrentUser 优先，UAC 兜底"的两阶段逻辑
+  // 后端 install_ca 按当前平台执行显式信任安装，并保留原始授权错误
   // ──────────────────────────────────────────────
   window.installCaFromHealth = async function () {
     if (!invoke) {
@@ -115,13 +118,11 @@
         return;
       }
     }
-    await ensureCertInstallProgressListener();
-    _lastCertProgressMessage = '';
     setCertInstallProgress({ message: '准备安装 CA 证书', percent: 3, level: 'info' });
     addLog && addLog('ok', '正在安装 CA 证书到系统根证书库...');
     setInstallCertButtonState('busy');
     try {
-      const msg = await invoke('cert_install');
+      const msg = await invokeCertTask('cert_install');
       setCertInstallProgress({ message: msg || 'CA 证书安装完成', percent: 100, level: 'ok' });
       addLog && addLog('ok', 'CA 证书安装: ' + msg);
       await window.runHealthcheck();
@@ -129,10 +130,11 @@
       const errMsg = String(e);
       setCertInstallProgress({ message: '安装失败: ' + errMsg, percent: 100, level: 'err' });
       addLog && addLog('err', 'CA 证书安装失败: ' + errMsg);
-      if (errMsg.includes('取消') || errMsg.includes('拒绝')) {
+      // macOS 无交互上下文不是用户取消；原始错误保留在进度/日志中，弹窗只补充授权指引。
+      if (errMsg.includes('取消') || errMsg.includes('拒绝') || errMsg.includes('no user interaction was possible')) {
         showCustomAlert && showCustomAlert(
-          '你取消了 UAC 授权（或拒绝访问）。CA 证书未安装到系统根证书库，IDE 会继续拒绝连接。\n\n如需重试，请再次点击「一键安装证书」。',
-          'CA 安装被取消',
+          '系统授权未完成或访问被拒绝。请查看具体错误，并在本地桌面会话中完成系统授权；不要反复重生证书。',
+          'CA 安装授权未完成',
           'warning'
         );
       }
@@ -142,8 +144,8 @@
   };
 
   // ──────────────────────────────────────────────
-  // 入口：用户点「清理并重装」—— 删旧 PEM + 卸旧 CN/旧指纹 + 重生 + 装信任库
-  // 给别人机器上证书乱/不匹配时一键修复用。
+  // 入口：用户点「清理并重装」，由后端决定平台策略；macOS 复用有效证书，只修复信任。
+  // 不承诺所有平台都删除旧根或重新签发；授权失败时提示查看原因，避免反复轮换 CA。
   // ──────────────────────────────────────────────
   window.reinstallCaFromHealth = async function () {
     if (!invoke) {
@@ -154,10 +156,8 @@
         return;
       }
     }
-    await ensureCertInstallProgressListener();
-    _lastCertProgressMessage = '';
     setCertInstallProgress({ message: '准备清理旧证书并重新安装', percent: 3, level: 'warn' });
-    addLog && addLog('warn', '正在清理并重装 CA 证书（强制重生 + 重装信任库）...');
+    addLog && addLog('warn', '正在按当前平台策略修复 CA 信任（macOS 保留有效证书，不强制轮换）...');
     const btn = _hEl('health-reinstall-cert-btn');
     if (btn) {
       btn.disabled = true;
@@ -166,7 +166,7 @@
     }
     setInstallCertButtonState('busy');
     try {
-      const msg = await invoke('cert_reinstall_clean');
+      const msg = await invokeCertTask('cert_reinstall_clean');
       setCertInstallProgress({ message: msg || 'CA 清理并重装完成', percent: 100, level: 'ok' });
       addLog && addLog('ok', 'CA 清理并重装: ' + msg);
       await window.runHealthcheck();
@@ -174,10 +174,11 @@
       const errMsg = String(e);
       setCertInstallProgress({ message: '清理并重装失败: ' + errMsg, percent: 100, level: 'err' });
       addLog && addLog('err', 'CA 清理并重装失败: ' + errMsg);
-      if (errMsg.includes('取消') || errMsg.includes('拒绝')) {
+      // macOS 无交互上下文不是用户取消；原始错误保留在进度/日志中，弹窗只补充授权指引。
+      if (errMsg.includes('取消') || errMsg.includes('拒绝') || errMsg.includes('no user interaction was possible')) {
         showCustomAlert && showCustomAlert(
-          '你取消了 UAC 授权（或拒绝访问）。证书可能未完整安装。\n\n请再次点击「清理并重装」，并在 UAC 弹窗中选择「是」。',
-          'CA 重装被取消',
+          '系统授权未完成或访问被拒绝。证书信任可能未完整安装，请查看具体错误并完成系统授权；不要反复重生证书。',
+          'CA 重装授权未完成',
           'warning'
         );
       }
@@ -202,13 +203,11 @@
         return;
       }
     }
-    await ensureCertInstallProgressListener();
-    _lastCertProgressMessage = '';
     setCertInstallProgress({ message: '准备卸载 CA 证书', percent: 3, level: 'warn' });
     addLog && addLog('warn', '正在卸载 CA 证书...');
     setUninstallCertButtonState('busy');
     try {
-      const msg = await invoke('cert_uninstall');
+      const msg = await invokeCertTask('cert_uninstall');
       setCertInstallProgress({ message: msg || 'CA 证书卸载完成', percent: 100, level: 'ok' });
       addLog && addLog('ok', 'CA 证书卸载: ' + msg);
       await window.runHealthcheck();
@@ -262,7 +261,7 @@
     const btn = _hEl('health-cleanup-legacy-btn');
     if (btn) { btn.disabled = true; btn.dataset.oldText = btn.textContent; btn.textContent = '清理中...'; }
     try {
-      const msg = await invoke('cert_cleanup_legacy');
+      const msg = await invokeCertTask('cert_cleanup_legacy');
       addLog && addLog('ok', '老证书清理: ' + msg);
       await window.runHealthcheck();
     } catch (e) {
@@ -366,11 +365,15 @@
     const genAtEl = _hEl('health-generated-at');
     if (genAtEl) genAtEl.textContent = '更新时间: ' + formatTs(ts);
 
-    const summaryText = report.ok
+    // 后端 report.ok 允许存在警告；只有错误和警告都为零才能显示“全部正常”。
+    const status = report.totals.err > 0 ? 'err' : report.totals.warn > 0 ? 'warn' : 'ok';
+    const summaryText = status === 'ok'
       ? `检测通过（全部检测项正常）`
-      : `体检未通过（发现 ${report.totals.err} 项异常，${report.totals.warn} 项提示）`;
+      : status === 'warn'
+        ? `检测完成（发现 ${report.totals.warn} 项提示，请查看详情）`
+        : `体检未通过（发现 ${report.totals.err} 项异常，${report.totals.warn} 项提示）`;
 
-    setHealthSummary(summaryText, report.ok ? 'ok' : (report.totals.err > 0 ? 'err' : 'warn'));
+    setHealthSummary(summaryText, status);
 
     const container = _hEl('health-groups');
     if (!container) return;
@@ -539,15 +542,37 @@
     try {
       _certInstallProgressUnlisten = await tauriEvent.listen('cert-install-progress', (event) => {
         const payload = event.payload || {};
+        if (payload.stage === 'start' && payload.requestId === _activeCertOperationId) {
+          _activeCertOperationId = payload.requestId;
+        }
+        if (!payload.requestId || payload.requestId !== _activeCertOperationId || _completedCertOperationIds.has(payload.requestId)) return;
         setCertInstallProgress(payload);
-        if (payload.message && payload.message !== _lastCertProgressMessage) {
-          _lastCertProgressMessage = payload.message;
+        const messageKey = `${payload.requestId}:${payload.stage || ''}:${payload.message || ''}`;
+        if (payload.message && !_certProgressMessageKeys.has(messageKey)) {
+          _certProgressMessageKeys.add(messageKey);
+          if (_certProgressMessageKeys.size > 256) _certProgressMessageKeys.delete(_certProgressMessageKeys.values().next().value);
           const level = payload.level === 'err' ? 'err' : (payload.level === 'warn' ? 'warn' : (payload.level === 'ok' ? 'ok' : 'info'));
-          addLog && addLog(level, '证书操作: ' + payload.message);
+          addLog && addLog(level, '证书操作 [' + (payload.operationId || payload.requestId) + ']: ' + payload.message);
         }
       });
     } catch (e) {
       addLog && addLog('warn', '证书安装进度监听不可用: ' + e);
+    }
+  }
+  async function invokeCertTask(command) {
+    await ensureCertInstallProgressListener();
+    const requestId = typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function'
+      ? crypto.randomUUID()
+      : `cert-ui-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    _activeCertOperationId = requestId;
+    try {
+      return await invoke(command, { requestId });
+    } finally {
+      _completedCertOperationIds.add(requestId);
+      if (_completedCertOperationIds.size > 32) {
+        _completedCertOperationIds.delete(_completedCertOperationIds.values().next().value);
+      }
+      if (_activeCertOperationId === requestId) _activeCertOperationId = null;
     }
   }
   function setCertInstallProgress(payload) {

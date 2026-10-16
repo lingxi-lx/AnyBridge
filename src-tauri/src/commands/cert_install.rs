@@ -1,6 +1,6 @@
 // cert_install.rs — 跨平台 CA 证书安装/卸载/状态查询。
 //
-// 核心策略（Windows 桌面端，95% 用户零弹窗）：
+// 核心策略（Windows 桌面端，95% 用户零弹窗）；macOS 的信任变更必须由显式桌面操作授权：
 //   1. 优先装到 `Cert:\CurrentUser\Root`（不需要管理员权限，不弹 UAC）
 //   2. Electron / Chromium 进程都会读 CurrentUser\Root，99% 桌面 Windows 可用
 //   3. 如果 Electron 不认（极少数边角情况），降级到 `LocalMachine\Root`，
@@ -21,6 +21,7 @@ use tauri::{AppHandle, Emitter};
 use crate::commands::system::{CA_COMMON_NAME, LEGACY_CA_COMMON_NAMES};
 
 /// 普通 certutil 调用超时（秒）。避免 verifystore/addstore 卡死导致 UI「Step is still running」。
+#[cfg(target_os = "windows")]
 const CERTUTIL_CMD_TIMEOUT_SECS: u64 = 20;
 /// 显式安装/卸载整条任务超时（秒）。UAC 等待算在内。
 const CERT_TASK_TIMEOUT_SECS: u64 = 120;
@@ -52,6 +53,10 @@ pub struct CaStatus {
     pub thumbprint: Option<String>,  // CA 的 SHA1 指纹
     pub effective_store: CaStore,    // 实际能用的位置
     pub message: String,             // 给人看的总体描述
+    /// macOS SSL 策略检查结果；None 表示未执行（平台不支持或材料缺失），不代表已信任。
+    pub system_trusted: Option<bool>,
+    /// 系统信任检查失败或超时的原因，与证书是否存在于存储中分开报告。
+    pub trust_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -61,14 +66,79 @@ pub struct CertInstallProgress {
     pub message: String,
     pub percent: u8,
     pub level: String,
+    /// 后端生成的任务 ID，用于关联日志、错误和进度。
+    pub operation_id: Option<String>,
+    /// 调用方提供的 UI 请求 ID，用于丢弃其他请求或已结束请求的迟到事件。
+    pub request_id: Option<String>,
 }
 
+// 深层同步证书函数无需逐层传 ID；任务线程入口绑定上下文，供后续进度事件读取。
+#[derive(Clone)]
+struct CertOperationContext {
+    operation_id: String,
+    request_id: Option<String>,
+}
+
+thread_local! {
+    // 进度产生于同步调用链；按工作线程隔离，避免并发任务串用彼此的 ID。
+    static CERT_OPERATION_CONTEXT: std::cell::RefCell<Option<CertOperationContext>> = const { std::cell::RefCell::new(None) };
+}
+
+struct CertOperationContextGuard(Option<CertOperationContext>);
+
+impl CertOperationContextGuard {
+    // 保存并恢复旧值，以支持嵌套锁调用和 panic 展开时不泄漏到后续操作。
+    fn set(operation_id: &str, request_id: Option<String>) -> Self {
+        let previous = CERT_OPERATION_CONTEXT.with(|context| {
+            context.replace(Some(CertOperationContext {
+                operation_id: operation_id.to_string(),
+                request_id,
+            }))
+        });
+        Self(previous)
+    }
+}
+
+impl Drop for CertOperationContextGuard {
+    // 无论正常返回还是栈展开，都恢复进入作用域前的线程上下文。
+    fn drop(&mut self) {
+        CERT_OPERATION_CONTEXT.with(|context| {
+            context.replace(self.0.take());
+        });
+    }
+}
+
+// 复制当前上下文后立即释放 RefCell 借用，避免事件发送期间持有线程本地借用。
+fn current_cert_operation_context() -> Option<CertOperationContext> {
+    CERT_OPERATION_CONTEXT.with(|context| context.borrow().clone())
+}
+
+// 深层同步流程统一走此入口，从当前任务上下文补齐关联 ID。
 fn emit_cert_progress(
     app: Option<&AppHandle>,
     stage: &str,
     message: &str,
     percent: u8,
     level: &str,
+) {
+    emit_cert_progress_for_operation(
+        app,
+        stage,
+        message,
+        percent,
+        level,
+        current_cert_operation_context(),
+    );
+}
+
+// 启动/结束事件可显式给出上下文；常规进度由 emit_cert_progress 读取线程本地上下文。
+fn emit_cert_progress_for_operation(
+    app: Option<&AppHandle>,
+    stage: &str,
+    message: &str,
+    percent: u8,
+    level: &str,
+    context: Option<CertOperationContext>,
 ) {
     eprintln!("[cert_install] {}: {}", stage, message);
     if let Some(app) = app {
@@ -79,6 +149,8 @@ fn emit_cert_progress(
                 message: message.to_string(),
                 percent: percent.min(100),
                 level: level.to_string(),
+                operation_id: context.as_ref().map(|context| context.operation_id.clone()),
+                request_id: context.and_then(|context| context.request_id),
             },
         );
     }
@@ -791,6 +863,16 @@ mod platform {
     }
 }
 
+// 交互上下文不可用不等于用户取消；保留系统原始错误，只为该情况补充恢复指引。
+#[cfg(any(target_os = "macos", test))]
+fn macos_trust_error(error: &str, cert_path: &Path) -> String {
+    if error.to_ascii_lowercase().contains("no user interaction was possible") {
+        format!("macOS 无法显示证书信任授权界面。请在本地登录的桌面会话中打开「钥匙串访问」，核对并导入公开 CA {}，按系统提示授权 SSL 信任；不要导入私钥，也不要反复重生证书。受管设备请联系管理员。原始错误: {}", cert_path.display(), error)
+    } else {
+        error.to_string()
+    }
+}
+
 #[cfg(target_os = "macos")]
 mod platform {
     use super::*;
@@ -829,6 +911,41 @@ mod platform {
             stdout
         } else {
             stderr
+        }
+    }
+
+    /// 使用系统信任锚验证磁盘叶子证书；不验证运行中代理或 IDE 自带的信任库。
+    pub fn verify_system_trust(cert_path: &Path) -> Result<(), String> {
+        let leaf = cert_path.with_file_name(crate::commands::system::MITM_LEAF_CERT_FILE);
+        // 多个 -c 按叶子、颁发者顺序提供链；不用 -r 强制信任本地 CA，-L 禁止联网补链。
+        let mut child = Command::new("/usr/bin/security")
+            .args(["verify-cert", "-p", "ssl", "-s", "server.codeium.com", "-L", "-c"])
+            .arg(&leaf)
+            .arg("-c")
+            .arg(cert_path)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| format!("无法启动 macOS SSL 信任验证: {}", e))?;
+        let started = std::time::Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) if status.success() => return Ok(()),
+                Ok(Some(status)) => return Err(format!("macOS SSL 信任验证未通过 ({})，请检查当前 CA 信任、叶子证书链、主机名和有效期", status)),
+                Ok(None) if started.elapsed() < std::time::Duration::from_secs(5) => {
+                    std::thread::sleep(std::time::Duration::from_millis(40));
+                }
+                result => {
+                    // 超时或等待失败均按未通过处理，并尝试终止、回收只读验证子进程。
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(match result {
+                        Err(e) => format!("等待 macOS SSL 信任验证失败: {}", e),
+                        _ => "macOS SSL 信任验证超时（5s），未判定为可信".into(),
+                    });
+                }
+            }
         }
     }
 
@@ -927,9 +1044,8 @@ mod platform {
 
     pub fn install_current_user(cert_path: &Path) -> Result<(), String> {
         let kc = login_keychain()?;
-        // 关键：不能带 `-d`。macOS 的 `security add-trusted-cert -d` 是「写入管理员信任设置」，
-        // 需要管理员授权，会把本该免密的用户级安装变成仍然要管理员——这也是之前 macOS 上
-        // 用户级安装必失败、只能走提权的原因。去掉 -d 才是真正的用户级（无需管理员密码）。
+        // 用户级安装不能带 `-d`；该参数会写入管理员信任设置并触发管理员授权。
+        // 这里仅指定登录钥匙串，仍可能因钥匙串策略要求交互授权。
         run_security(
             &["add-trusted-cert", "-r", "trustRoot", "-k"],
             &[&kc, cert_path],
@@ -937,12 +1053,14 @@ mod platform {
         Ok(())
     }
 
+    /// 仅由用户显式安装入口调用；代理后台不得调用该系统级提权路径。
     pub fn install_local_machine_via_uac(cert_path: &Path) -> Result<(), String> {
         let command = format!(
             "security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain {}",
             shell_quote(&cert_path.to_string_lossy())
         );
-        run_admin_shell(&command)
+        // 提权成功不保证信任设置具备交互上下文；失败时不绕过授权，也不自动轮换 CA。
+        run_admin_shell(&command).map_err(|error| macos_trust_error(&error, cert_path))
     }
 
     pub fn uninstall_from_store(cn: &str, current_user: bool) -> Result<(), String> {
@@ -1328,10 +1446,27 @@ mod platform {
     }
 }
 
+// 已执行的系统检查失败时，证书存在也不算有效；未实现检查的平台保留原有存在性判定。
+fn store_is_effective(current_user: bool, local_machine: bool, system_trusted: Option<bool>) -> bool {
+    (current_user || local_machine) && system_trusted != Some(false)
+}
+
+// 仅 macOS 接入原生 SSL 策略检查；其他平台返回 None，而不是伪造检查成功。
+fn system_trust_result(cert_path: &Path) -> Option<Result<(), String>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(platform::verify_system_trust(cert_path))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cert_path;
+        None
+    }
+}
+
 // ──────────────────────────────────────────────────────────
 // 公共 API
 // ──────────────────────────────────────────────────────────
-
 static CA_STATUS_CACHE: std::sync::Mutex<Option<(std::time::Instant, CaStatus)>> =
     std::sync::Mutex::new(None);
 static LEGACY_RESIDUAL_CACHE: std::sync::Mutex<Option<(std::time::Instant, bool)>> =
@@ -1349,14 +1484,23 @@ pub fn invalidate_ca_status_cache() {
 /// 查询 CA 在系统中的安装状态。
 pub fn check_ca_status() -> CaStatus {
     // 1. 检查最近缓存（2 秒内直接返回，避免频繁调用如每秒状态轮询或批量保存时重复执行系统检测）
-    if let Ok(guard) = CA_STATUS_CACHE.lock() {
-        if let Some((time, ref status)) = *guard {
-            if time.elapsed() < std::time::Duration::from_millis(2000) {
-                return status.clone();
-            }
-        }
+    if let Some(status) = cached_ca_status(&CA_STATUS_CACHE) {
+        return status;
     }
+    check_ca_status_fresh()
+}
 
+// 将缓存判断与系统访问分离，使过期测试不依赖真实钥匙串或系统命令耗时。
+fn cached_ca_status(
+    cache: &std::sync::Mutex<Option<(std::time::Instant, CaStatus)>>,
+) -> Option<CaStatus> {
+    let guard = cache.lock().ok()?;
+    let (time, status) = guard.as_ref()?;
+    (time.elapsed() < std::time::Duration::from_secs(2)).then(|| status.clone())
+}
+
+/// 绕过应用层状态缓存并回填新结果，供启动及安装后复验使用；不清除操作系统自身缓存。
+pub(crate) fn check_ca_status_fresh() -> CaStatus {
     let (cert_path, key_path) = cert_paths().unwrap_or_else(|_| {
         (
             PathBuf::from("certs/server.codeium.com.pem"),
@@ -1374,13 +1518,31 @@ pub fn check_ca_status() -> CaStatus {
         None
     };
 
-    let (current_user, local_machine, legacy_residual) = platform::query_ca_store_status(
-        thumbprint.as_deref(),
-        CA_COMMON_NAME,
-        LEGACY_CA_COMMON_NAMES,
-    );
+    // 没有当前磁盘证书时，只能报告残留，不能按 CN 将其他证书认作当前 CA。
+    let (current_user, local_machine, legacy_residual) = if thumbprint.is_some() {
+        platform::query_ca_store_status(
+            thumbprint.as_deref(),
+            CA_COMMON_NAME,
+            LEGACY_CA_COMMON_NAMES,
+        )
+    } else {
+        let legacy_residual = LEGACY_CA_COMMON_NAMES
+            .iter()
+            .any(|cn| platform::is_in_store(cn, true) || platform::is_in_store(cn, false));
+        (false, false, legacy_residual)
+    };
 
-    let effective_store = if current_user || local_machine {
+    // 证书材料缺失时不运行 macOS SSL 子进程，避免用“验证失败”掩盖“文件未生成”。
+    let trust_result = if cert_exists && key_exists {
+        system_trust_result(&cert_path)
+    } else {
+        None
+    };
+    let system_trusted = trust_result.as_ref().map(Result::is_ok);
+    let trust_error = trust_result.and_then(Result::err);
+    let effective_store = if cert_exists && key_exists && san_current
+        && store_is_effective(current_user, local_machine, system_trusted)
+    {
         if current_user {
             CaStore::CurrentUser
         } else {
@@ -1390,29 +1552,28 @@ pub fn check_ca_status() -> CaStatus {
         CaStore::None
     };
 
-    let message = if cert_exists && key_exists && !san_current {
+    // 优先报告缺失材料和原始信任错误；存储位置不能证明 IDE 使用的信任库已接受该链。
+    let message = if !cert_exists || !key_exists {
+        "证书材料缺失；请先停止代理，在环境检测中生成证书，再显式安装信任".to_string()
+    } else if let Some(error) = &trust_error {
+        error.clone()
+    } else if cert_exists && key_exists && !san_current {
         format!(
-            "MITM 证书缺少 Cursor 所需 SAN（当前标记: {}，需要: {}）；点击「生成 MITM 证书」或「安装证书」会重新生成",
+            "MITM 证书缺少当前 SAN 或证书材料无效（当前标记: {}，需要: {}）；请先停止代理，生成证书后显式安装信任",
             san_version.as_deref().unwrap_or("missing"),
             crate::commands::system::mitm_cert_san_version()
         )
     } else {
         match effective_store {
             CaStore::CurrentUser => format!(
-                "当前 CA 证书已装到 {}（无需管理员权限），IDE 可信",
+                "当前 CA 证书存在于 {}；证书存在不代表 IDE 已信任，请验证实际 TLS 请求",
                 current_user_store_label()
             ),
             CaStore::LocalMachine => format!(
-                "当前 CA 证书已装到 {}（系统级，IDE 可信）",
+                "当前 CA 证书存在于 {}（系统级）；仍需验证系统信任和 IDE 实际 TLS 请求",
                 local_machine_store_label()
             ),
-            CaStore::None => {
-                if !cert_exists {
-                    "证书文件未生成；点击「安装证书」会自动生成并安装".to_string()
-                } else {
-                    "当前 CA 证书尚未安装到系统根证书库，IDE 会拒绝连接".to_string()
-                }
-            }
+            CaStore::None => "当前 CA 证书未完成系统信任；请显式安装信任并验证 IDE 实际 TLS 请求".to_string(),
         }
     };
 
@@ -1429,6 +1590,8 @@ pub fn check_ca_status() -> CaStatus {
         thumbprint,
         effective_store,
         message,
+        system_trusted,
+        trust_error,
     };
 
     if let Ok(mut guard) = CA_STATUS_CACHE.lock() {
@@ -1438,15 +1601,16 @@ pub fn check_ca_status() -> CaStatus {
     res
 }
 
-/// 一键安装 CA：先尝试 CurrentUser\Root（零弹窗），失败才走 UAC 兜底。
-/// 升级路径会自动清理老证书。
+/// 显式安装 CA：Windows 当前策略直接请求系统级授权；用户级尝试由 install_ca_user_only 提供。
+/// macOS 只修复当前有效证书包的信任，不轮换 CA 或自动清理旧根。
+/// 此底层入口不获取任务锁或代理占位，桌面调用方须在外层提供保护。
 #[allow(dead_code)]
 pub fn install_ca() -> Result<String, String> {
     install_ca_with_options(false, false)
 }
 
-/// 仅装用户信任库，绝不弹 UAC（保留 API；当前主路径已改为提权装 LocalMachine）。
-/// 注意：CurrentUser\Root 安装会触发 Windows「安全警告」弹窗。
+/// 仅尝试用户级信任库，不请求管理员授权；供代理启动/体检的保守修复路径使用。
+/// Windows 用户级安装仍可能显示系统安全确认，但不会进入提权路径。
 #[allow(dead_code)]
 pub fn install_ca_user_only(
     force_regenerate: bool,
@@ -1455,7 +1619,8 @@ pub fn install_ca_user_only(
     install_ca_impl(None, force_regenerate, prefer_fresh_install, false)
 }
 
-/// `force_regenerate`：删除 PEM 并重生后再安装（「清理并重装」）。
+/// `force_regenerate`：Windows/其他平台删除 PEM 并重生后再安装（「清理并重装」）；
+/// macOS 分支保留当前有效证书包，不在授权失败前覆盖证书。
 /// `prefer_fresh_install`：安装前先清掉当前 CN 下不匹配的旧指纹（防止同名多证书乱）。
 #[allow(dead_code)]
 pub fn install_ca_with_options(
@@ -1492,7 +1657,18 @@ fn cleanup_stale_current_user_cn(keep_thumbprint: &str) -> String {
     }
 }
 
+// 公共入口取得独占包锁；已由组合流程持锁时改走下层函数，避免 flock 重入自冲突。
 fn install_ca_impl(
+    app: Option<AppHandle>,
+    force_regenerate: bool,
+    prefer_fresh_install: bool,
+    allow_admin: bool,
+) -> Result<String, String> {
+    let _package_lock = crate::commands::system::acquire_mitm_package_write_lock()?;
+    install_ca_impl_with_package_lock(app, force_regenerate, prefer_fresh_install, allow_admin)
+}
+
+pub(crate) fn install_ca_impl_with_package_lock(
     app: Option<AppHandle>,
     force_regenerate: bool,
     prefer_fresh_install: bool,
@@ -1515,22 +1691,72 @@ fn install_ca_impl(
         "info",
     );
     let (cert_path, key_path) = cert_paths()?;
+    let certs_dir = cert_path.parent().ok_or("CA 路径缺少父目录")?;
+    // 候选目录可能属于仍在运行的生成任务；包状态不确定时不修改系统信任，也不自动清理现场。
+    crate::commands::system::reject_interrupted_mitm_candidates(certs_dir)?;
+
+    // macOS 的重装入口只修复当前包的信任，不执行 force_regenerate 或旧根清理。
+    // 避免授权失败前已覆盖磁盘证书，导致代理内存、磁盘与钥匙串使用不同证书。
+    if cfg!(target_os = "macos") {
+        let leaf_path = cert_path.with_file_name(crate::commands::system::MITM_LEAF_CERT_FILE);
+        let leaf_key = cert_path.with_file_name(crate::commands::system::MITM_LEAF_KEY_FILE);
+        if is_san_current(&cert_path, cert_path.exists(), key_path.exists())
+            && crate::commands::system::validate_mitm_cert_files(&leaf_path, &leaf_key).is_ok()
+        {
+            // CA 文件存在也不代表配套私钥正确；在任何系统信任探测或授权前验证公私钥匹配。
+            crate::commands::system::validate_mitm_cert_files(&cert_path, &key_path)
+                .map_err(|e| format!("macOS CA 证书包校验失败，未请求信任授权: {}", e))?;
+            // 授权前先验证磁盘链，避免为错误链申请信任；失败不轮换文件或修改钥匙串。
+            let certs_dir = cert_path.parent().ok_or("CA 路径缺少父目录")?;
+            crate::commands::system::validate_mitm_candidate_chain(certs_dir)
+                .map_err(|e| format!("macOS 证书包离线校验失败，未请求信任授权: {}", e))?;
+
+            if system_trust_result(&cert_path).is_some_and(|result| result.is_ok()) {
+                return Ok("macOS SSL 信任验证已通过，无需重装或轮换证书；请验证 IDE 实际请求".into());
+            }
+
+            if !allow_admin {
+                return Err("macOS 信任变更需要显式授权，请在环境检测中点击安装证书；后台不会修改钥匙串".into());
+            }
+            emit_cert_progress(app.as_ref(), "admin", "正在修复现有 CA 的系统信任，不轮换证书；请在 macOS 系统授权界面确认", 65, "warn");
+            platform::install_local_machine_via_uac(&cert_path)?;
+            invalidate_ca_status_cache();
+
+            // 命令退出成功不等于可信：当前指纹入库与系统 SSL 链验证必须分别通过。
+            let thumbprint = compute_thumbprint(&cert_path)?;
+            if !platform::is_thumbprint_in_store(&thumbprint, false) {
+                return Err("安装命令已退出，但 System keychain 未找到当前 CA 指纹".into());
+            }
+            if let Some(result) = system_trust_result(&cert_path) {
+                result?;
+            }
+
+            return Ok("现有 CA 信任安装及 macOS SSL 验证已完成，未轮换证书；请重新运行环境检测并验证 IDE 实际请求".into());
+        }
+
+        return Err("macOS 当前证书包缺失或无效。请先停止代理，在环境检测中生成证书，再显式安装信任；本次未覆盖证书或清理钥匙串".into());
+    }
 
     let cert_ok = cert_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let key_ok = key_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    let leaf_path = cert_path.with_file_name(crate::commands::system::MITM_LEAF_CERT_FILE);
+    let leaf_key_path = cert_path.with_file_name(crate::commands::system::MITM_LEAF_KEY_FILE);
+    // 此处仅按文件存在性决定是否补齐旧包；补齐后还会单独校验叶子证书、私钥及签名链。
+    let leaf_ok = leaf_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && leaf_key_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let san_current = is_san_current(&cert_path, cert_ok, key_ok);
-    let need_generate = force_regenerate || !cert_ok || !key_ok || !san_current;
+    let need_generate = force_regenerate || !cert_ok || !key_ok || !leaf_ok || !san_current;
     let auto_generate_msg = if need_generate {
         let reason = if force_regenerate {
             "正在强制重新生成 MITM 证书"
-        } else if !cert_ok || !key_ok {
-            "证书文件缺失或为空，正在自动生成 MITM 证书"
+        } else if !cert_ok || !key_ok || !leaf_ok {
+            "证书包文件缺失或为空，正在自动生成 MITM 证书"
         } else {
             "MITM 证书缺少 Cursor 所需 SAN，正在重新生成"
         };
         emit_cert_progress(app.as_ref(), "auto_generate", reason, 8, "info");
         let (certs_dir, generated) =
-            crate::commands::system::ensure_mitm_certs_ex(force_regenerate)
+            crate::commands::system::ensure_mitm_certs_ex_unlocked(force_regenerate)
                 .map_err(|e| format!("自动生成证书失败: {}", e))?;
         Some(if generated {
             format!("已自动生成证书到 {}", certs_dir.to_string_lossy())
@@ -1543,15 +1769,25 @@ fn install_ca_impl(
 
     let cert_ok = cert_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
     let key_ok = key_path.metadata().map(|m| m.len() > 0).unwrap_or(false);
+    // 文件存在不代表证书包可用；安装前再次确认叶子证书与私钥有效且匹配。
+    let leaf_ok = leaf_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && leaf_key_path.metadata().map(|m| m.len() > 0).unwrap_or(false)
+        && crate::commands::system::validate_mitm_cert_files(&leaf_path, &leaf_key_path).is_ok();
     let san_current = is_san_current(&cert_path, cert_ok, key_ok);
-    if !cert_ok || !key_ok || !san_current {
+    if !cert_ok || !key_ok || !leaf_ok || !san_current {
         return Err(format!(
-            "证书文件自动生成后仍不完整或 SAN 标记未更新: {}, {} (san_current={})",
+            "证书文件自动生成后仍不完整或 SAN 标记未更新: {}, {} (leaf_ok={}, san_current={})",
             cert_path.to_string_lossy(),
             key_path.to_string_lossy(),
+            leaf_ok,
             san_current
         ));
     }
+    // 所有平台都必须先验证叶子到当前 CA 的离线链，防止仅凭 CA 文件存在就写入系统信任。
+    crate::commands::system::validate_mitm_candidate_chain(
+        cert_path.parent().ok_or("CA 路径缺少父目录")?,
+    )
+    .map_err(|e| format!("证书包离线校验失败，未执行信任安装: {}", e))?;
     let thumbprint =
         compute_thumbprint(&cert_path).map_err(|e| format!("证书指纹计算失败: {}", e))?;
     emit_cert_progress(
@@ -1573,7 +1809,10 @@ fn install_ca_impl(
                 local_machine_store_label()
             };
             // 仍尝试清理 legacy，不影响成功路径
-            let _ = cleanup_legacy_cn();
+            // 非 Windows 的后台路径不能顺带调用可能提权的旧根清理。
+            if allow_admin || cfg!(target_os = "windows") {
+                let _ = cleanup_legacy_cn();
+            }
             let msg = format!(
                 "CA 已在 {}（无需重装）。Thumbprint: {}",
                 store, thumbprint
@@ -1589,9 +1828,12 @@ fn install_ca_impl(
     // 清理老 CN + 同 CN 旧指纹（不影响新证书安装）
     emit_cert_progress(app.as_ref(), "cleanup", "正在清理旧版/残留证书", 20, "info");
     let mut cleanup_notes = String::new();
-    if let Ok(legacy_msg) = cleanup_legacy_cn() {
-        if legacy_msg != "无老证书残留" {
-            cleanup_notes.push_str(&legacy_msg);
+    // 非 Windows 的后台路径不能顺带调用可能提权的旧根清理。
+    if allow_admin || cfg!(target_os = "windows") {
+        if let Ok(legacy_msg) = cleanup_legacy_cn() {
+            if legacy_msg != "无老证书残留" {
+                cleanup_notes.push_str(&legacy_msg);
+            }
         }
     }
     if force_regenerate || prefer_fresh_install || need_generate {
@@ -1700,7 +1942,8 @@ fn install_ca_impl(
         });
     }
 
-    // 阶段 2：管理员授权，装到系统级根证书库。
+    // 阶段 2：仅用户显式触发时请求管理员授权，装到系统级根证书库。
+    // 代理启动和后台体检不应进入此分支，避免隐藏或不可交互的授权弹窗。
     eprintln!(
         "[cert_install] install_ca: install to {} via {}",
         local_machine_store_label(),
@@ -1710,8 +1953,9 @@ fn install_ca_impl(
         app.as_ref(),
         "admin",
         &format!(
-            "接下来系统会弹出 {} 授权窗口，请输入本机密码并确认。弹窗可能被其它窗口挡住，也可能出现在另一个桌面，请留意屏幕（macOS 常见「没看到弹窗」导致授权超时）",
-            admin_prompt_label()
+            "正在请求 {} 授权安装到 {}，请按系统提示确认。授权窗口可能被其它窗口挡住或出现在另一个桌面；若未显示，请切换到本地登录的桌面会话。",
+            admin_prompt_label(),
+            local_machine_store_label()
         ),
         65,
         "warn",
@@ -1786,7 +2030,13 @@ pub fn uninstall_ca() -> Result<String, String> {
     uninstall_ca_impl(None)
 }
 
+// 卸载可能修改当前 CA 信任；与安装和证书轮换共享同一跨进程独占锁。
 fn uninstall_ca_impl(app: Option<AppHandle>) -> Result<String, String> {
+    let _package_lock = crate::commands::system::acquire_mitm_package_write_lock()?;
+    uninstall_ca_impl_with_package_lock(app)
+}
+
+fn uninstall_ca_impl_with_package_lock(app: Option<AppHandle>) -> Result<String, String> {
     invalidate_ca_status_cache();
     emit_cert_progress(
         app.as_ref(),
@@ -1796,9 +2046,16 @@ fn uninstall_ca_impl(app: Option<AppHandle>) -> Result<String, String> {
         "warn",
     );
     let mut removed = Vec::new();
-    let current_thumbprint = cert_paths()
-        .ok()
-        .and_then(|(cert_path, _)| compute_thumbprint(&cert_path).ok());
+
+    // macOS 缺少确切指纹时停止，不把当前 CA 卸载扩大为同名证书删除。
+    let current_thumbprint = if cfg!(target_os = "macos") {
+        let (cert_path, _) = cert_paths()?;
+        Some(compute_thumbprint(&cert_path).map_err(|e| format!(
+            "无法确认待卸载 CA 指纹，未修改钥匙串；请在钥匙串访问中核对证书后手动处理: {}", e
+        ))?)
+    } else {
+        cert_paths().ok().and_then(|(cert_path, _)| compute_thumbprint(&cert_path).ok())
+    };
 
     // CurrentUser 卸
     emit_cert_progress(
@@ -1889,7 +2146,10 @@ fn uninstall_ca_impl(app: Option<AppHandle>) -> Result<String, String> {
     }
 
     // 顺手卸老证书
-    let _ = cleanup_legacy_cn();
+    // macOS 卸载只针对当前确切指纹；旧根需要独立确认，不随当前 CA 卸载一起删除。
+    if !cfg!(target_os = "macos") {
+        let _ = cleanup_legacy_cn();
+    }
 
     if removed.is_empty() {
         emit_cert_progress(
@@ -1920,6 +2180,14 @@ fn uninstall_ca_impl(app: Option<AppHandle>) -> Result<String, String> {
 /// 两个 store 都查（CurrentUser + LocalMachine），因为老版本
 /// 经常用 certutil -addstore Root 装到 LM。
 pub fn cleanup_legacy_cn() -> Result<String, String> {
+    // macOS 目前没有按确切指纹枚举并逐项确认的清理流程；拒绝按 CN 批量删除，
+    // 防止误删企业管理证书、其他安装来源的根证书或用户明确保留的旧根。
+    if cfg!(target_os = "macos") {
+        return Err(
+            "macOS 旧根清理需要用户逐项确认确切指纹；当前未执行任何钥匙串删除，请在钥匙串访问中手动核对".into(),
+        );
+    }
+
     invalidate_ca_status_cache();
     let mut msg = String::new();
 
@@ -1962,83 +2230,173 @@ pub fn cert_check_status() -> CaStatus {
     check_ca_status()
 }
 
-async fn run_cert_task(
+/// 串行化经此入口提交的证书任务；直接调用底层函数不受此保护。
+static CERT_TASK_RUNNING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+// 正常返回、错误返回及 panic 展开时都失效缓存并释放占位，不把失败前的状态留给后续轮询。
+struct CertTaskGuard {
+    operation_id: String,
+}
+
+// 时间戳、进程号和进程内序号仅用于诊断关联，不承载密钥或授权凭据。
+fn next_cert_operation_id() -> String {
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default().as_nanos();
+    format!("cert-{}-{stamp}-{sequence}", std::process::id())
+}
+
+impl Drop for CertTaskGuard {
+    fn drop(&mut self) {
+        // 守卫释放只表示底层任务结束，错误或 panic 路径也会经过这里，不代表操作成功。
+        eprintln!("[cert_install][{}] task_finished", self.operation_id);
+        invalidate_ca_status_cache();
+        CERT_TASK_RUNNING.store(
+            false,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+}
+
+// 非阻塞获取：并发及嵌套调用直接报忙，不排队等待系统授权，避免重复弹窗或自锁。
+fn acquire_cert_task() -> Result<CertTaskGuard, String> {
+    if CERT_TASK_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_err()
+    {
+        return Err("另一个证书任务仍在执行，请等待完成后再操作".into());
+    }
+    let operation_id = next_cert_operation_id();
+    eprintln!("[cert_install][{}] task_started", operation_id);
+    Ok(CertTaskGuard { operation_id })
+}
+
+/// 为同步体检/启动路径复用同一证书互斥，避免自动修复与显式操作并发。
+// 同步自动修复也绑定后端操作 ID；没有 UI 请求时 request_id 保持为空。
+pub(crate) fn with_cert_task_lock<T>(
+    task: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    let guard = acquire_cert_task()?;
+    let _operation_context = CertOperationContextGuard::set(&guard.operation_id, None);
+    task().map_err(|error| format!("{} [操作 ID: {}]", error, guard.operation_id))
+}
+
+pub(crate) async fn run_cert_task(
     label: &'static str,
+    app: Option<AppHandle>,
+    request_id: Option<String>,
     task: impl FnOnce() -> Result<String, String> + Send + 'static,
 ) -> Result<String, String> {
-    let handle = tauri::async_runtime::spawn_blocking(task);
-    match tokio::time::timeout(
+    // 外层超时不会取消已运行的阻塞任务；将守卫移入任务，实际结束后才允许下一次操作。
+    let guard = acquire_cert_task()?;
+
+    // 外层等待与阻塞任务共享同一个 ID；超时后守卫仍由阻塞任务持有。
+    let operation_id = guard.operation_id.clone();
+
+    // request ID 仅用于 UI 事件关联，限制格式和长度，避免任意调用方数据进入事件/日志。
+    let request_id = request_id.filter(|id| id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    let task_operation_id = operation_id.clone();
+    let task_request_id = request_id.clone();
+
+    // 先发起始事件，让前端在任何深层进度到达前建立本次请求与后端操作的关联。
+    emit_cert_progress_for_operation(app.as_ref(), "start", label, 0, "info", Some(CertOperationContext {
+        operation_id: operation_id.clone(),
+        request_id: request_id.clone(),
+    }));
+
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let _guard = guard;
+        // 线程本地状态不能跨 spawn_blocking 自动继承，必须在实际工作的线程重新绑定。
+        let _operation_context = CertOperationContextGuard::set(&task_operation_id, task_request_id);
+        task()
+    });
+
+    let result = match tokio::time::timeout(
         std::time::Duration::from_secs(CERT_TASK_TIMEOUT_SECS),
         handle,
     )
     .await
     {
-        Ok(result) => result.map_err(|e| format!("{}任务失败: {}", label, e))?,
+        Ok(Ok(task_result)) => task_result.map_err(|error| format!("{} [操作 ID: {}]", error, operation_id)),
+        Ok(Err(error)) => Err(format!("{}任务失败: {} [操作 ID: {}]", label, error, operation_id)),
         Err(_) => Err(format!(
-            "{}超时（{}s）。可能 UAC 弹窗被系统隐藏、用户未确认，或 certutil 被杀软拦截。请重试并在 UAC 中点「是」",
-            label, CERT_TASK_TIMEOUT_SECS
+            "{}超时（{}s）。系统授权或证书操作尚未返回；底层任务可能仍在执行，请勿重复操作，先检查系统授权界面 [操作 ID: {}]",
+            label, CERT_TASK_TIMEOUT_SECS, operation_id
         )),
-    }
-}
-
-#[tauri::command]
-pub async fn cert_install(app: AppHandle) -> Result<String, String> {
-    let progress_app = app.clone();
-    let result = run_cert_task("CA 安装", move || {
-        install_ca_impl(Some(progress_app), false, false, true)
-    })
-    .await;
-    if let Err(e) = &result {
-        emit_cert_progress(
-            Some(&app),
+    };
+    // 统一在包装层发最终错误事件，涵盖任务错误、JoinError 和外层超时。
+    if let Err(error) = &result {
+        emit_cert_progress_for_operation(
+            app.as_ref(),
             "error",
-            &format!("CA 证书安装失败: {}", e),
+            error,
             100,
             "err",
+            Some(CertOperationContext { operation_id, request_id }),
         );
     }
     result
 }
 
-/// 清理旧证书并强制重生 + 重装（给「别人机器用不了」一键修复用）。
+// 先占证书任务、再检查并占用代理启动位；检查覆盖整个安装过程，不只保护文件生成。
+// request_id 只用于把前端进度事件归回发起它的 UI 调用。
 #[tauri::command]
-pub async fn cert_reinstall_clean(app: AppHandle) -> Result<String, String> {
+pub async fn cert_install(app: AppHandle, request_id: Option<String>) -> Result<String, String> {
+    let proxy_app = app.clone();
     let progress_app = app.clone();
-    let result = run_cert_task("CA 清理并重装", move || {
-        install_ca_impl(Some(progress_app), true, true, true)
+    run_cert_task("CA 安装", Some(app.clone()), request_id, move || {
+        crate::commands::proxy::with_proxy_stopped(&proxy_app, || {
+            install_ca_impl(Some(progress_app), false, false, true)
+        })
     })
-    .await;
-    if let Err(e) = &result {
-        emit_cert_progress(
-            Some(&app),
-            "error",
-            &format!("CA 清理并重装失败: {}", e),
-            100,
-            "err",
-        );
-    }
-    result
+    .await
 }
 
+/// 停止状态下按平台策略重装；macOS 只修复现有有效包的信任，不执行强制轮换。
+/// request_id 用于将本次 UI 请求与进度事件关联。
 #[tauri::command]
-pub async fn cert_uninstall(app: AppHandle) -> Result<String, String> {
+pub async fn cert_reinstall_clean(app: AppHandle, request_id: Option<String>) -> Result<String, String> {
+    let proxy_app = app.clone();
     let progress_app = app.clone();
-    let result = run_cert_task("CA 卸载", move || uninstall_ca_impl(Some(progress_app))).await;
-    if let Err(e) = &result {
-        emit_cert_progress(
-            Some(&app),
-            "uninstall_error",
-            &format!("CA 证书卸载失败: {}", e),
-            100,
-            "err",
-        );
-    }
-    result
+    run_cert_task("CA 清理并重装", Some(app.clone()), request_id, move || {
+        crate::commands::proxy::with_proxy_stopped(&proxy_app, || {
+            install_ca_impl(Some(progress_app), true, true, true)
+        })
+    })
+    .await
 }
 
+// 卸载也需保持代理停止，避免运行中的 TLS 链突然失去信任；失败由前端按错误展示。
+// request_id 用于将本次 UI 请求与进度事件关联。
 #[tauri::command]
-pub async fn cert_cleanup_legacy() -> Result<String, String> {
-    run_cert_task("老证书清理", cleanup_legacy_cn).await
+pub async fn cert_uninstall(app: AppHandle, request_id: Option<String>) -> Result<String, String> {
+    let proxy_app = app.clone();
+    let progress_app = app.clone();
+    run_cert_task("CA 卸载", Some(app.clone()), request_id, move || {
+        crate::commands::proxy::with_proxy_stopped(&proxy_app, || {
+            uninstall_ca_impl(Some(progress_app))
+        })
+    })
+    .await
+}
+
+// 清理可能涉及系统授权，只从显式操作执行；与其他证书任务共享互斥及代理停止约束。
+// request_id 用于将本次 UI 请求与进度事件关联。
+#[tauri::command]
+pub async fn cert_cleanup_legacy(app: AppHandle, request_id: Option<String>) -> Result<String, String> {
+    let proxy_app = app.clone();
+    run_cert_task("老证书清理", Some(app), request_id, move || {
+        crate::commands::proxy::with_proxy_stopped(&proxy_app, cleanup_legacy_cn)
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -2056,6 +2414,77 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    // 验证嵌套任务退出后恢复外层 ID，且最终清空上下文；不触碰系统证书库。
+    #[test]
+    fn certificate_operation_context_is_scoped_and_restored() {
+        assert!(current_cert_operation_context().is_none());
+        {
+            let _context = CertOperationContextGuard::set("operation-a", Some("request-a".into()));
+            let context = current_cert_operation_context().expect("operation context");
+            assert_eq!(context.operation_id, "operation-a");
+            assert_eq!(context.request_id.as_deref(), Some("request-a"));
+            {
+                let _nested = CertOperationContextGuard::set("operation-b", None);
+                let nested = current_cert_operation_context().expect("nested operation context");
+                assert_eq!(nested.operation_id, "operation-b");
+            }
+            assert_eq!(current_cert_operation_context().unwrap().operation_id, "operation-a");
+        }
+        assert!(current_cert_operation_context().is_none());
+    }
+
+    #[test]
+    fn certificate_operation_ids_are_distinct() {
+        let ids: std::collections::HashSet<_> = (0..1000)
+            .map(|_| next_cert_operation_id()).collect();
+        assert_eq!(ids.len(), 1000);
+        assert!(ids.iter().all(|id| id.starts_with(&format!("cert-{}-", std::process::id()))));
+    }
+
+    // 覆盖跨线程/嵌套拒绝，以及错误和 panic 展开后的释放；不操作真实证书库。
+    #[test]
+    fn certificate_task_lock_rejects_overlap_and_releases_on_error_or_panic() {
+        let result: Result<(), String> = with_cert_task_lock(|| {
+            assert!(with_cert_task_lock(|| Ok(())).is_err());
+            std::thread::spawn(|| {
+                assert!(with_cert_task_lock(|| Ok(())).is_err());
+            }).join().unwrap();
+            Err("certificate task failed".into())
+        });
+        assert!(result.unwrap_err().starts_with("certificate task failed [操作 ID: cert-"));
+        assert_eq!(with_cert_task_lock(|| Ok(42)).unwrap(), 42);
+        let result = std::panic::catch_unwind(|| {
+            let _ = with_cert_task_lock(|| -> Result<(), String> {
+                panic!("certificate task panicked")
+            });
+        });
+        assert!(result.is_err());
+        assert!(with_cert_task_lock(|| Ok(())).is_ok());
+    }
+
+    #[test]
+    fn installed_certificate_requires_successful_system_trust_when_checked() {
+        assert!(!store_is_effective(true, false, Some(false)));
+        assert!(!store_is_effective(false, true, Some(false)));
+        assert!(!store_is_effective(false, false, Some(true)));
+        assert!(store_is_effective(true, false, Some(true)));
+        assert!(store_is_effective(false, true, Some(true)));
+        assert!(store_is_effective(true, false, None));
+        assert!(!store_is_effective(false, false, None));
+    }
+
+    #[test]
+    fn macos_interaction_error_preserves_reason_and_recovery() {
+        let raw = "SecTrustSettingsSetTrustSettings: The authorization was denied since no user interaction was possible. (1)";
+        let message = macos_trust_error(raw, Path::new("/tmp/Any Bridge/ca.pem"));
+        assert!(message.contains(raw));
+        assert!(message.contains("钥匙串访问"));
+        assert!(message.contains("/tmp/Any Bridge/ca.pem"));
+        assert!(!message.contains("你取消"));
+        assert!(!message.contains("UAC"));
+        assert_eq!(macos_trust_error("other failure", Path::new("ca.pem")), "other failure");
     }
 
     #[test]
@@ -2090,18 +2519,36 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // 使用独立缓存验证 TTL 与错误保留，不对真实系统检测耗时作不稳定的性能断言。
     #[test]
-    fn test_check_ca_status_time() {
-        let start1 = std::time::Instant::now();
-        let _status1 = check_ca_status();
-        let duration1 = start1.elapsed();
-
-        let start2 = std::time::Instant::now();
-        let status2 = check_ca_status();
-        let duration2 = start2.elapsed();
-
-        assert!(duration1 < std::time::Duration::from_millis(500), "冷启动检测应低于 500ms，实际为 {:?}", duration1);
-        assert!(duration2 < std::time::Duration::from_millis(10), "缓存命中应在微秒级，实际为 {:?}", duration2);
-        assert!(status2.cert_file.contains("server.codeium.com.pem"));
+    fn ca_status_cache_expires_without_accessing_system_stores() {
+        let cache = std::sync::Mutex::new(None);
+        assert!(cached_ca_status(&cache).is_none());
+        let status = CaStatus {
+            common_name: CA_COMMON_NAME.into(),
+            cert_file: "certs/server.codeium.com.pem".into(),
+            cert_exists: true,
+            key_exists: true,
+            san_version: Some(crate::commands::system::mitm_cert_san_version().into()),
+            san_current: true,
+            current_user: true,
+            local_machine: false,
+            legacy_residual: false,
+            thumbprint: Some("test-thumbprint".into()),
+            effective_store: CaStore::None,
+            message: "system trust failed".into(),
+            system_trusted: Some(false),
+            trust_error: Some("system trust failed".into()),
+        };
+        *cache.lock().unwrap() = Some((std::time::Instant::now(), status.clone()));
+        let cached = cached_ca_status(&cache).expect("recent status is cached");
+        assert_eq!(cached.cert_file, status.cert_file);
+        assert_eq!(cached.system_trusted, Some(false));
+        assert_eq!(cached.trust_error, status.trust_error);
+        *cache.lock().unwrap() = Some((
+            std::time::Instant::now() - std::time::Duration::from_secs(3),
+            status,
+        ));
+        assert!(cached_ca_status(&cache).is_none());
     }
 }

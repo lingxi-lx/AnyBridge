@@ -29,6 +29,9 @@ import { extractModelList, unlockModels } from './rename-models.js';
 import { mitmLog, rpcAuditLog } from './mitm-logger.js';
 import { httpsAgentFor } from './system-proxy.js';
 import { attachPluginRoutes } from './plugin-loader.js';
+import { createRateLimitedLogger } from './lib/log-rate-limit.js';
+
+Object.assign(console, createRateLimitedLogger(console));
 
 function intEnv(name, fallback, min = 1) {
   const n = parseInt(process.env[name] || '', 10);
@@ -210,6 +213,8 @@ let requestCounter = 0;
 // `unknown ca`、`certificate verify failed`。
 // 出现这类错误时 MITM 直接断，模型改写不会执行（表现为"还是原模型"），必须让人能自查。
 const CA_COMMON_NAME_HINT = '「AnyBridge Local CA」';
+const CERT_REJECTION_LOG_INTERVAL_MS = 60_000;
+let lastCertRejectionLogAt = 0;
 function mitmCertRejected(err) {
   const text = String((err && (err.message || err.code)) || '').toLowerCase();
   if (!text) return false;
@@ -234,6 +239,7 @@ let lastModelListSig = '';
 let lastModelListCapturedAt = 0;
 let lastModelCaptureLogAt = 0;
 let lastModelRewriteLogAt = 0;
+let lastTakeoverLogAt = 0;
 // unlockModels 结果缓存：同一秒内输入相同 → 复用上次结果
 let lastUnlockInputSig = '';
 let lastUnlockResult = null;
@@ -583,11 +589,16 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
         //   - 注入项（model-map.json 的 injected）→ label 改写为 "(BYOK) {label} (服务商/未配置)" + 解锁
         //   - 全部解锁（删 field4 disabled = true）让下拉框灰色项可点
         let stripEncoding = false;
+        let cliRewriteDiagnostic = null;
         const shouldRewriteModels = proxyRes.statusCode === 200
           && (method === 'GetUserStatus' || method === 'GetCliModelConfigs');
         if (shouldRewriteModels) {
           // 接管心跳：这一条请求证明 IDE 的流量确实经过了代理
           noteTakeoverRequest(upstream);
+          if (Date.now() - lastTakeoverLogAt >= 10000) {
+            lastTakeoverLogAt = Date.now();
+            console.log(`  [#${id}] takeover heartbeat: target=${upstream === 'server.codeium.com' ? 'devin' : 'windsurf'} method=${method} status=${proxyRes.statusCode}`);
+          }
           // 抓取原始模型清单(改名前)→ 缓存供 GUI 添加映射时选用（仅 GetUserStatus，清单最全）。
           // 性能优化：每秒 8-10 次心跳 → 节流到 30s 一次 + 签名比对
           // 注意：unlockModels 仍然每次都做（必须做，下拉框要看到 BYOK 项）
@@ -604,7 +615,8 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
                     lastModelListSig = sig;
                     writeCapturedModelList(file, list);
                     noteTakeoverCapture(upstream);
-                    console.log(`  [#${id}] 📋 captured ${list.length} Windsurf models → ide-models.json`);
+                    const target = upstream === 'server.codeium.com' ? 'Devin' : 'Windsurf';
+                    console.log(`  [#${id}] 📋 已捕获 ${target} 模型 ${list.length} 个 → ide-models.json`);
                   }
                 }
               }
@@ -614,28 +626,51 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
             }
           }
           try {
-            // 节流：unlockModels 是个完整改写。心跳频繁 → 1s 内同一响应只跑一次
-            // 用 resBody 的 sha1 短路——上游响应没变，直接复用上次结果
+            // 相同响应和配置复用已计算结果，避免高频心跳重复解析大块 protobuf。
             const inputSig = `${method}|${crypto.createHash('sha1').update(resBody).digest('hex').slice(0, 16)}|${rewriteConfigSignature()}`;
-            if (inputSig === lastUnlockInputSig && lastUnlockResult) {
-              resBody = lastUnlockResult.body;
-              if (lastUnlockResult.wasConnect) stripEncoding = true;
+            const responseBytes = resBody.length;
+            const contentType = String(proxyRes.headers['content-type'] || '-');
+            const contentEncoding = String(proxyRes.headers['content-encoding'] || '-');
+            const connectEncoding = String(proxyRes.headers['connect-content-encoding'] || '-');
+            // 只检查 gzip magic bytes 和 Connect 帧长度，不解码或记录 protobuf 正文。
+            const isGzip = resBody[0] === 0x1f && resBody[1] === 0x8b;
+            const frameLength = resBody.length >= 5 ? resBody.readUInt32BE(1) : -1;
+            const isConnectFrame = (resBody[0] === 0 || resBody[0] === 1)
+              && frameLength === resBody.length - 5;
+            const inputFormat = isGzip ? 'gzip' : (isConnectFrame ? `Connect帧(flags=${resBody[0]})` : '裸protobuf/其他');
+            const cacheHit = inputSig === lastUnlockInputSig && !!lastUnlockResult;
+            let rewriteResult;
+            if (cacheHit) {
+              rewriteResult = lastUnlockResult;
+              resBody = rewriteResult.body;
+              if (rewriteResult.wasConnect) stripEncoding = true;
             } else {
-              const result = unlockModels(resBody);
-              if (result) {
-                resBody = result.body;
-                if (result.wasConnect) stripEncoding = true;
-                lastUnlockResult = result;
+              rewriteResult = unlockModels(resBody);
+              if (rewriteResult) {
+                resBody = rewriteResult.body;
+                if (rewriteResult.wasConnect) stripEncoding = true;
+                lastUnlockResult = rewriteResult;
                 lastUnlockInputSig = inputSig;
-                // 5s 内只打一次 rewrite 日志
-                if (Date.now() - lastModelRewriteLogAt > 5000) {
-                  console.log(`  [#${id}] 🔄 ${method}: rewrote ${result.changed} model(s) (rename+unlock+inject)`);
-                  lastModelRewriteLogAt = Date.now();
-                }
               }
             }
+            if (method === 'GetCliModelConfigs') {
+              // CLI 请求同一轮可能并发出现多次，不做时间限频；仅记录格式和大小，不记录模型正文或凭据。
+              cliRewriteDiagnostic = {
+                responseBytes,
+                inputFormat,
+                contentType,
+                contentEncoding,
+                connectEncoding,
+                cacheHit,
+                changed: rewriteResult ? rewriteResult.changed : 0,
+                outputBytes: resBody.length,
+              };
+            } else if (rewriteResult && Date.now() - lastModelRewriteLogAt > 5000) {
+              console.log(`  [#${id}] 🔄 ${method}：已改写 ${rewriteResult.changed} 个模型（重命名、解锁、注入）`);
+              lastModelRewriteLogAt = Date.now();
+            }
           } catch (e) {
-            console.error(`  [#${id}] rewrite models error: ${e.message}`);
+            console.error(`  [#${id}] 模型列表改写失败：${e.message}`);
           }
         }
 
@@ -643,6 +678,13 @@ function proxyToCodeium(req, res, body, id, opts = {}) {
           stripEncoding,
           contentLength: resBody.length,
         });
+        if (cliRewriteDiagnostic) {
+          const d = cliRewriteDiagnostic;
+          const outcome = d.changed > 0 ? `已改写 ${d.changed} 个模型` : '未改写';
+          // 使用清洗后的响应头记录最终编码，Connect 帧重写时可能已移除上游编码声明。
+          const outputEncoding = resHeaders['content-encoding'] || '-';
+          console.log(`  [#${id}] 🔄 GetCliModelConfigs：${outcome}，缓存命中=${d.cacheHit ? '是' : '否'}，格式=${d.inputFormat}，上游=${d.responseBytes}字节/输出=${d.outputBytes}字节，类型=${d.contentType}，编码=${d.contentEncoding}，Connect编码=${d.connectEncoding}，返回编码=${outputEncoding}`);
+        }
         res.writeHead(proxyRes.statusCode, resHeaders);
         res.end(resBody);
       });
@@ -1297,11 +1339,17 @@ server.on('connect', (req, clientSocket, head) => {
       // 客户端不认我们的证书时，光甩一行 OpenSSL 内部错误没人看得懂，
       // 直接把排查动作写清楚（这种失败会导致模型改写不生效，表现为"还是原模型"）。
       if (mitmCertRejected(err)) {
-        console.error(
-          `  [#${id}] ❗ 客户端拒绝了 MITM 证书 → 请到「平台(智能体) > 设置 > 环境检测」点「清理并重装」，` +
-          '并在系统弹窗里允许授权；然后完全退出 IDE 再打开。若仍失败，检查系统钥匙串/证书库里 ' +
-          `${CA_COMMON_NAME_HINT} 是否为「始终信任」。`
-        );
+        // 原始 TLS 错误仍逐次记录；只节流重复结构事件和操作指引，避免握手风暴刷屏。
+        const nowMs = Date.now();
+        if (nowMs - lastCertRejectionLogAt >= CERT_REJECTION_LOG_INTERVAL_MS) {
+          lastCertRejectionLogAt = nowMs;
+          console.error('ANYBRIDGE_EVENT:TLS_CLIENT_CERT_REJECTED');
+          console.error(
+            `  [#${id}] ❗ 客户端拒绝了 MITM 证书 → 请到「平台(智能体) > 设置 > 环境检测」点「清理并重装」，` +
+            '并在系统弹窗里允许授权；然后完全退出 IDE 再打开。若仍失败，检查系统钥匙串/证书库里 ' +
+            `${CA_COMMON_NAME_HINT} 是否为「始终信任」。`
+          );
+        }
       }
       if (!clientSocket.destroyed) clientSocket.destroy();
     });

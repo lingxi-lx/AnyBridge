@@ -1580,6 +1580,7 @@ pub async fn extension_switch_cpa_version(
 
 // ═══════ 停止与更新 ═══════
 
+#[cfg(target_os = "windows")]
 fn local_addr_port(local_addr: &str) -> Option<u16> {
     // 支持 127.0.0.1:8317 / 0.0.0.0:8317 / [::1]:8317 / [::]:8317
     if let Some(rest) = local_addr.strip_prefix('[') {
