@@ -67,17 +67,36 @@ fi
 # 元数据，用户自动更新静默失效，只能手动补传。
 #
 # 这里改为「按当前列表精确删除同名资产 → 上传」，删除与上传都各自容错，状态可收敛。
-delete_existing_assets() {
-  local names base
+asset_exists() {
+  local base="$1" names
   names="$(gh release view "$TAG" --repo "$REPO" --json assets --jq -r '.assets[].name' 2>/dev/null)"
-  [ -z "$names" ] && return 0
+  [ -z "$names" ] && return 1
+  printf '%s\n' "$names" | grep -Fxq "$base"
+}
+
+delete_existing_assets() {
+  local base waited
   for f in "${FILES[@]}"; do
     base="$(basename "$f")"
-    if printf '%s\n' "$names" | grep -Fxq "$base"; then
-      echo "删除已存在的同名资产: $base"
-      gh release delete-asset "$TAG" --repo "$REPO" "$base" --yes 2>/dev/null || \
-        echo "::warning::删除 $base 失败（可能已被并发删除），继续上传"
-    fi
+    asset_exists "$base" || continue
+
+    echo "删除已存在的同名资产: $base"
+    gh release delete-asset "$TAG" --repo "$REPO" "$base" --yes 2>/dev/null || \
+      echo "::warning::删除 $base 失败（可能已被并发删除）"
+
+    # 删除是异步收敛的：API 列表可能已删、上传端点仍认为存在（422 already exists），
+    # 也可能反过来（删除请求落到已失效的资产 id 而 404）。两者都会让「删了再传」
+    # 变成死循环（v0.5.30 / v0.5.34 就是这么失败的）。所以必须等到资产名从 API
+    # 列表里真正消失再上传；等不到就把现状说出来，交由上传重试那一层兜底。
+    waited=0
+    while asset_exists "$base"; do
+      if [ "$waited" -ge 60 ]; then
+        echo "::warning::$base 删除后 60s 仍在资产列表中可见，继续尝试上传"
+        break
+      fi
+      sleep 3
+      waited=$((waited + 3))
+    done
   done
 }
 
