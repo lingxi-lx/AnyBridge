@@ -138,7 +138,7 @@ audit:
         try {
           let composeContent = await ctx.fs.readFile(composeSrc, 'utf-8');
           // Replace hardcoded port mapping with user-configured port
-          const port = configValues.port || 8000;
+          const port = configValues.port || 8700;
           composeContent = composeContent.replace(/"8000:8000"/g, `"${port}:${port}"`);
           await ctx.fs.writeFile(composeDest, composeContent, 'utf-8');
         } catch { /* non-fatal — docker compose will fail with a clear error */ }

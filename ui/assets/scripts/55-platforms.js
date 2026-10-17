@@ -9920,6 +9920,9 @@ function isCpaLocalProxy(p) {
 function isOtherBuiltinProxy(p) {
   if (!p) return false;
   if (isAnyBridgeLocalProxy(p) || isCpaLocalProxy(p)) return false;
+  // 插件自动登记的本地供应商（plugin-<id>）；isPluginLocalProvider 在 30 的模块作用域里，此处内联等价判断
+  const pluginLocalId = String(p.providerId || p.id || p.provider_id || '');
+  if (pluginLocalId.startsWith('plugin-')) return true;
   if (p.isBuiltin === true || p.builtin === true || p.meta?.builtin === true || p.meta?.isBuiltin === true) return true;
   if (p.meta?.pluginProxy === true || p.isPluginProxy === true || p.meta?.isProxy === true || p.isProxy === true) return true;
   if (p.meta?.cpaLocal === true || p.meta?.localProxy === true) return true;
@@ -10802,6 +10805,7 @@ function openCbEditModal(prefix, index) {
   const levelsField = document.getElementById('cb-edit-reasoning-levels-field');
   const levelsMapField = document.getElementById('cb-edit-reasoning-map-field');
   const buddyEffortExtra = document.getElementById('cb-edit-buddy-effort-extra');
+  const buddyThinkingExtra = document.getElementById('cb-edit-buddy-thinking-extra');
   const reasoningTitle = document.getElementById('cb-edit-reasoning-title');
   const reasoningSubtitle = document.getElementById('cb-edit-reasoning-subtitle');
   const reasoningHint = document.getElementById('cb-edit-reasoning-hint');
@@ -10812,6 +10816,7 @@ function openCbEditModal(prefix, index) {
     if (prefix === 'Zc') {
       if (levelsMapField) levelsMapField.style.display = '';
       if (buddyEffortExtra) buddyEffortExtra.style.display = 'none';
+      if (buddyThinkingExtra) buddyThinkingExtra.style.display = 'none';
       if (reasoningTitle) reasoningTitle.textContent = '思考档位';
       if (reasoningSubtitle) reasoningSubtitle.textContent = '选中的档位可在聊天界面自由切换，留空则保持默认';
       zcRenderReasoningLevelChips(
@@ -10827,6 +10832,7 @@ function openCbEditModal(prefix, index) {
     } else {
       if (levelsMapField) levelsMapField.style.display = 'none';
       if (buddyEffortExtra) buddyEffortExtra.style.display = '';
+      if (buddyThinkingExtra) buddyThinkingExtra.style.display = '';
       if (reasoningTitle) reasoningTitle.textContent = '思考档位白名单';
       if (reasoningSubtitle) reasoningSubtitle.textContent = '只勾选上游实际支持的档位，未勾选的档位永远不会被发送';
       zcRenderReasoningLevelChips(
@@ -10834,6 +10840,11 @@ function openCbEditModal(prefix, index) {
       );
       cbBindEffortChipsSync();
       cbRenderDefaultEffortOptions(model.reasoning?.defaultEffort || '');
+      // 思考开关：onlyReasoning 与 canDisableThinking 都会让聊天界面隐藏「关闭思考」；
+      // 「允许关闭思考」默认勾选（= 不写 canDisableThinking，保持客户端默认）。
+      platformSetValue('cb-edit-only-reasoning', !!model.onlyReasoning);
+      platformSetValue('cb-edit-allow-disable-thinking', model.reasoning?.canDisableThinking !== false);
+      platformSetValue('cb-edit-reasoning-summary', model.reasoning?.summary || '');
       if (reasoningHint) {
         reasoningHint.textContent = '留空 = 不限制（客户端请求的档位原样透传给上游）；配置白名单后，白名单外的请求档位会自动回落到默认档，可避免上游不认某个档位时报 400';
       }
@@ -10841,6 +10852,7 @@ function openCbEditModal(prefix, index) {
   } else {
     if (levelsMapField) levelsMapField.style.display = 'none';
     if (buddyEffortExtra) buddyEffortExtra.style.display = 'none';
+    if (buddyThinkingExtra) buddyThinkingExtra.style.display = 'none';
   }
 
   // ZCode 的个人配置不含工具调用字段（由 ZCode 内置默认恒为启用），隐藏无效勾选避免误导。
@@ -11009,8 +11021,16 @@ async function saveCbEditFromModal() {
     const reasoning = {};
     if (efforts.length > 0) reasoning.supportedEfforts = efforts;
     if (defEffort && (efforts.length === 0 || efforts.includes(defEffort))) reasoning.defaultEffort = defEffort;
+    // 思考开关：取消勾选「允许关闭思考」→ canDisableThinking=false，聊天界面不再出现 Off
+    if (!document.getElementById('cb-edit-allow-disable-thinking')?.checked) reasoning.canDisableThinking = false;
+    const summaryMode = (document.getElementById('cb-edit-reasoning-summary')?.value || '').trim();
+    if (summaryMode) reasoning.summary = summaryMode;
     if (Object.keys(reasoning).length > 0) entry.reasoning = reasoning;
     else delete entry.reasoning;
+
+    // onlyReasoning 与 reasoning 平级，客户端同样用它隐藏「关闭思考」
+    if (document.getElementById('cb-edit-only-reasoning')?.checked) entry.onlyReasoning = true;
+    else delete entry.onlyReasoning;
   }
 
   // ZCode：思考档位写入条目（空数组 = 不配置，删除旧键实现"清除"）

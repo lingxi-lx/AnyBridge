@@ -1595,6 +1595,12 @@ const CODEBUDDY_USER_FIELDS: &[&str] = &[
     "disabledMultimodal",
     "reasoning",
     "enabled",
+    // 思考开关：与 reasoning 一样属于用户在弹窗里配置的项，
+    // 供应商重新应用时必须原样搬过来，否则「仅思考模型」会被冲掉。
+    //
+    // 注意 supportsReasoning 刻意**不在**此列表：它由 codebuddy_supports_reasoning
+    // 的命名启发式生成，保留旧值会让推断词表的改进对已有条目永久失效。
+    "onlyReasoning",
 ];
 
 fn upsert_models_json_entry(
@@ -4013,6 +4019,12 @@ fn is_codex_official_template_candidate(
     {
         return false;
     }
+    // 旧版 Codex 写入的 models_cache 条目没有 base_instructions。Codex 0.146+ 对
+    // model catalog 做严格 schema 校验，拿这类条目当模板 deep-clone 会产出
+    // `missing field base_instructions` 的 catalog，直接排除。
+    if !has_base_instructions(model) {
+        return false;
+    }
     let slug = model
         .get("slug")
         .and_then(Value::as_str)
@@ -4025,6 +4037,54 @@ fn is_codex_official_template_candidate(
         return false;
     }
     !prefer_openai_slug || slug.starts_with("gpt-")
+}
+
+/// 模型条目是否带 Codex 严格 schema 要求的 `base_instructions`（非空字符串）。
+pub(crate) fn has_base_instructions(model: &Value) -> bool {
+    model
+        .get("base_instructions")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+}
+
+/// catalog 条目是否覆盖 bundled 模板的全部字段（Codex 严格 schema 校验用）。
+///
+/// `base_instructions` 额外要求非空字符串；其余字段只要求键存在。这样 Codex
+/// 后续版本再新增必填字段时，只要 bundled 模板同步更新，旧 catalog 会自动判定
+/// 为过期并重建，而不是继续沿用。
+pub(crate) fn catalog_entry_has_required_fields(model: &Value) -> bool {
+    if !has_base_instructions(model) {
+        return false;
+    }
+    let Some(obj) = model.as_object() else {
+        return false;
+    };
+    let (template, _) = codex_bundled_model_template(CODEX_BUNDLED_CATALOG_TEMPLATE_SLUG);
+    let Some(template_obj) = template.as_object() else {
+        return true;
+    };
+    template_obj.keys().all(|key| obj.contains_key(key))
+}
+
+/// 用 bundled gpt-5.5 的完整定义补齐模型条目缺失的字段（不覆盖已有值）。
+///
+/// Codex 0.146+ 把 `base_instructions` 等字段列为必填，而旧版 `models_cache.json`
+/// 模板没有这些字段。deep-clone 旧模板会产出让 `codex` 启动即报
+/// `missing field` 的 catalog，因此所有生成路径统一在这里兜底。
+fn backfill_model_fields_from_bundled(model: &mut Value) {
+    let (template, _) = codex_bundled_model_template(CODEX_BUNDLED_CATALOG_TEMPLATE_SLUG);
+    let (Some(template_obj), Some(obj)) = (template.as_object(), model.as_object_mut()) else {
+        return;
+    };
+    for (key, value) in template_obj {
+        // 键缺失或为 null 都视为缺失：旧版 models_cache 里出现过
+        // `"base_instructions": null` 这类占位写法。
+        let needs_fill = matches!(obj.get(key), None | Some(Value::Null));
+        if needs_fill {
+            obj.insert(key.clone(), value.clone());
+        }
+    }
 }
 
 /// 生成 Codex 模型目录 JSON 内容。
@@ -4053,7 +4113,7 @@ pub(crate) fn generate_model_catalog_json(entries: &[ModelCatalogEntry]) -> Resu
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            if is_codex_bundled_model(&e.model) {
+            let mut entry_model = if is_codex_bundled_model(&e.model) {
                 // ── 新版逻辑：使用 bundled catalog 完整定义 ──
                 let (mut model, _) = codex_bundled_model_template(&e.model);
                 let obj = model
@@ -4099,7 +4159,10 @@ pub(crate) fn generate_model_catalog_json(entries: &[ModelCatalogEntry]) -> Resu
                 obj["visibility"] = serde_json::json!("list");
                 obj["supported_in_api"] = serde_json::json!(true);
                 obj
-            }
+            };
+            // 旧模板即便被选为模板，也可能缺 Codex 0.146+ 的必填字段，统一补齐。
+            backfill_model_fields_from_bundled(&mut entry_model);
+            entry_model
         })
         .collect();
 
@@ -6637,15 +6700,50 @@ fn sync_zcode_personal_config_at(path: &Path, models: &[Value]) -> Result<(), St
         .map_err(|e| format!("写入 provider_config.json 失败: {e}"))
 }
 
+/// 推断上游模型是否支持思考/推理档位。
+///
+/// AnyBridge 手里没有权威的能力数据源（`ProviderCapabilities` 只有 text/stream/vision/tools），
+/// 所以按模型族命名做启发式判断，结果只作为**首次写入时的默认值**；
+/// 该键已列入 `CODEBUDDY_USER_FIELDS`，用户在编辑弹窗里勾选后不会被供应商重新应用覆盖。
+///
+/// 按「型号段」匹配而不是整串包含，避免同族的非推理小版本被误判（例如 glm-4-flash）。
 fn codebuddy_supports_reasoning(model: &str) -> bool {
     let m = model.to_ascii_lowercase();
-    m.contains("reason")
-        || m.contains("thinking")
-        || m.contains("deepseek-r1")
-        || m == "r1"
-        || m.starts_with("o1")
-        || m.starts_with("o3")
-        || m.starts_with("o4")
+
+    // 显式标记 + OpenAI 推理系（o1/o3/o4 系列只匹配开头，避免命中任意含 o1 的名称）
+    if m.contains("reason") || m.contains("thinking") || m.contains("deepseek-r1") || m == "r1" {
+        return true;
+    }
+    if ["o1", "o3", "o4", "o5"].iter().any(|p| m.starts_with(p)) {
+        return true;
+    }
+
+    // 各厂商的思考 / 混合推理型号段
+    const REASONING_MODEL_SEGMENTS: &[&str] = &[
+        "gpt-oss",
+        "gpt-5",
+        "gpt-6",
+        "qwen3",
+        "glm-4.5",
+        "glm-4.6",
+        "glm-5",
+        "kimi-k2",
+        "kimi-k3",
+        "minimax-m2",
+        "grok-4",
+        "grok-3-mini",
+        "gemini-3",
+        "gemini-2.5",
+        "deepseek-v3.1",
+        "deepseek-v3.2",
+        "deepseek-v4",
+        "claude-3-7",
+        "claude-sonnet-4",
+        "claude-opus-4",
+        "claude-opus-5",
+        "claude-haiku-4",
+    ];
+    REASONING_MODEL_SEGMENTS.iter().any(|seg| m.contains(seg))
 }
 
 fn split_url_origin_path(input: &str) -> Option<(String, String, String)> {
@@ -8212,6 +8310,87 @@ mod tests {
         value.as_object().cloned().unwrap()
     }
 
+    /// Codex 0.146+ 对 model catalog 做严格 schema 校验：任何条目缺
+    /// `base_instructions` 等字段都会让 `codex` 启动直接失败。旧版 models_cache
+    /// 模板没有这些字段，生成时必须由 bundled 模板补齐。
+    #[test]
+    fn generated_catalog_entries_satisfy_codex_required_fields() {
+        let entries = vec![
+            crate::commands::config::ModelCatalogEntry {
+                model: "gpt-5-codex".to_string(),
+                display_name: None,
+                context_window: None,
+            },
+            crate::commands::config::ModelCatalogEntry {
+                model: "claude-sonnet-4-5-20250929".to_string(),
+                display_name: None,
+                context_window: None,
+            },
+        ];
+        let raw = generate_model_catalog_json(&entries).expect("catalog should be generated");
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let models = parsed["models"].as_array().unwrap();
+        assert_eq!(models.len(), entries.len());
+        for model in models {
+            assert!(
+                has_base_instructions(model),
+                "missing base_instructions: {}",
+                model["slug"]
+            );
+            assert!(
+                model.get("supports_reasoning_summaries").is_some(),
+                "missing supports_reasoning_summaries: {}",
+                model["slug"]
+            );
+            assert!(
+                model.get("model_messages").is_some(),
+                "missing model_messages: {}",
+                model["slug"]
+            );
+        }
+    }
+
+    /// 旧版 models_cache 模板缺 `base_instructions`（或写成 null）时，
+    /// deep-clone 出来的条目必须被补齐，且不能覆盖已有字段。
+    #[test]
+    fn backfill_repairs_legacy_template_without_base_instructions() {
+        let mut model = serde_json::json!({
+            "slug": "claude-sonnet-4-5-20250929",
+            "display_name": "Claude Sonnet 4.5",
+            "base_instructions": null
+        });
+        backfill_model_fields_from_bundled(&mut model);
+        assert!(has_base_instructions(&model));
+        assert_eq!(model["slug"], "claude-sonnet-4-5-20250929");
+        assert_eq!(model["display_name"], "Claude Sonnet 4.5");
+        assert!(model.get("supports_reasoning_summaries").is_some());
+    }
+
+    /// 旧 catalog 的过期判定必须能抓到 schema 缺字段，否则 AnyBridge 不会重建。
+    #[test]
+    fn catalog_entry_required_field_check_detects_stale_schema() {
+        let entries = vec![crate::commands::config::ModelCatalogEntry {
+            model: "gpt-5-codex".to_string(),
+            display_name: None,
+            context_window: None,
+        }];
+        let raw = generate_model_catalog_json(&entries).unwrap();
+        let parsed: Value = serde_json::from_str(&raw).unwrap();
+        let model = parsed["models"][0].clone();
+        assert!(catalog_entry_has_required_fields(&model));
+
+        let mut stale = model.clone();
+        stale
+            .as_object_mut()
+            .unwrap()
+            .remove("base_instructions");
+        assert!(!catalog_entry_has_required_fields(&stale));
+
+        let mut nulled = model.clone();
+        nulled["base_instructions"] = Value::Null;
+        assert!(!catalog_entry_has_required_fields(&nulled));
+    }
+
     #[test]
     fn upsert_models_json_entry_keeps_user_settings_for_same_provider() {
         let mut obj = models_json_obj(
@@ -8220,8 +8399,8 @@ mod tests {
                 "id": "grok-4.7", "name": "黑与白Grok", "vendor": "user",
                 "url": "https://ai.hybgzs.com/v1/chat/completions", "apiKey": "k1",
                 "maxInputTokens": 500000, "maxOutputTokens": 32000,
-                "temperature": 0.3, "modelId": "grok-4.7",
-                "reasoning": { "supportedEfforts": ["high"] }
+                "temperature": 0.3, "modelId": "grok-4.7", "onlyReasoning": true,
+                "reasoning": { "supportedEfforts": ["high"], "canDisableThinking": false, "summary": "auto" }
               }]
             }"#,
         );
@@ -8242,6 +8421,10 @@ mod tests {
         assert_eq!(entry["temperature"], 0.3);
         assert_eq!(entry["modelId"], "grok-4.7");
         assert_eq!(entry["reasoning"]["supportedEfforts"][0], "high");
+        // 思考开关与思考档位同属用户配置，供应商重新应用时整体搬过来
+        assert_eq!(entry["onlyReasoning"], true);
+        assert_eq!(entry["reasoning"]["canDisableThinking"], false);
+        assert_eq!(entry["reasoning"]["summary"], "auto");
     }
 
     #[test]

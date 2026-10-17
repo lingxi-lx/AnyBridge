@@ -1163,6 +1163,23 @@ async fn fetch_latest_release_attempt(repo: &str) -> Result<GithubRelease, Strin
     ))
 }
 
+/// 取最新发布版本号：API 优先（带 token 时不受限流），失败再走网页重定向。
+/// api.github.com 与 github.com 是两个独立域名，一条路被墙/被证书拦截时另一条通常还能用。
+pub(crate) async fn latest_release_tag(repo: &str) -> Result<String, String> {
+    match fetch_latest_release(repo).await {
+        Ok(release) => Ok(release.tag_name),
+        Err(api_err) => match fetch_latest_release_via_web_redirect(repo).await {
+            Ok(release) => Ok(release.tag_name),
+            Err(web_err) => Err(format!(
+                "无法获取 {} 的最新版本号：{}；{}",
+                repo,
+                api_err.trim_end_matches('。'),
+                web_err
+            )),
+        },
+    }
+}
+
 #[tauri::command]
 pub async fn extension_list_managed_services() -> Result<Vec<ExtensionServiceStatus>, String> {
     tauri::async_runtime::spawn_blocking(|| vec![scan_cpa_suite()])
@@ -1590,7 +1607,7 @@ fn local_addr_port(local_addr: &str) -> Option<u16> {
     local_addr.rsplit_once(':')?.1.parse().ok()
 }
 
-fn pid_listening_on_port(port: u16) -> Option<u32> {
+pub(crate) fn pid_listening_on_port(port: u16) -> Option<u32> {
     #[cfg(target_os = "windows")]
     {
         // 注意：不能用 findstr :8317 —— 会误匹配 :18317（子串包含 8317）
@@ -2531,11 +2548,14 @@ fn build_download_client() -> Result<reqwest::Client, String> {
     builder.build().map_err(|e| e.to_string())
 }
 
+/// 进度回调：调用方决定进度事件投递到哪个界面（扩展部署 / 插件部署）。
+pub(crate) type DownloadProgress<'a> = &'a (dyn Fn(&str, u8) + Send + Sync);
+
 /// 从单个 URL 下载文件（带进度回调 + 停滞检测），返回下载的临时文件路径
 async fn download_from_url(
     url: &str,
     tmp: &Path,
-    app: &AppHandle,
+    on_progress: DownloadProgress<'_>,
     base_percent: u8,
     end_percent: u8,
 ) -> Result<(), String> {
@@ -2590,7 +2610,7 @@ async fn download_from_url(
                             format!("下载中 {:.1} MB", downloaded as f64 / 1_000_000.0),
                         )
                     };
-                    emit_deploy_progress(app, "download", &msg, pct);
+                    on_progress(&msg, pct);
                     last_emit = std::time::Instant::now();
                 }
             }
@@ -2630,7 +2650,7 @@ async fn download_from_url(
     Ok(())
 }
 
-/// 带镜像测速 + 轮询回退的下载
+/// 带镜像测速 + 轮询回退的下载（扩展部署用：进度投递到扩展部署界面）
 async fn download_asset(
     url: &str,
     filename: &str,
@@ -2638,15 +2658,31 @@ async fn download_asset(
     base_percent: u8,
     end_percent: u8,
 ) -> Result<PathBuf, String> {
+    let emit = |msg: &str, pct: u8| emit_deploy_progress(app, "download", msg, pct);
+    download_asset_with(url, filename, &emit, base_percent, end_percent).await
+}
+
+/// 带镜像测速 + 轮询回退的下载，进度由调用方投递。
+///
+/// 这是 CPA / 扩展部署用的同一条链路：跟随 Windows 系统代理（reqwest 与 curl 的
+/// 证书信任源不同，企业网或本机代理环境下 curl 常常直接 60 失败）、并发测速挑最快
+/// 镜像、逐个镜像重试、失败再换源。
+pub(crate) async fn download_asset_with(
+    url: &str,
+    filename: &str,
+    on_progress: DownloadProgress<'_>,
+    base_percent: u8,
+    end_percent: u8,
+) -> Result<PathBuf, String> {
     let tmp = std::env::temp_dir().join(filename);
 
     // 1. 测速
-    emit_deploy_progress(app, "download", "正在测速，寻找最快下载源...", base_percent);
+    on_progress("正在测速，寻找最快下载源...", base_percent);
     let ranked = speed_test_mirrors(url).await;
 
     if ranked.is_empty() {
         // 没有可用镜像，直接从原始 URL 下载
-        download_from_url(url, &tmp, app, base_percent, end_percent).await?;
+        download_from_url(url, &tmp, on_progress, base_percent, end_percent).await?;
         return Ok(tmp);
     }
 
@@ -2661,34 +2697,25 @@ async fn download_asset(
         };
 
         if i == 0 {
-            emit_deploy_progress(
-                app,
-                "download",
+            on_progress(
                 &format!("从 {} 下载...（测速 {}）", mirror.name, speed_label),
                 base_percent,
             );
         } else {
-            emit_deploy_progress(
-                app,
-                "download",
-                &format!("切换到 {} 重试下载...", mirror.name),
-                base_percent,
-            );
+            on_progress(&format!("切换到 {} 重试下载...", mirror.name), base_percent);
         }
 
         let mut mirror_err = String::new();
         for attempt in 0..2u32 {
             if attempt > 0 {
                 let delay = Duration::from_secs(2u64 * (1 << attempt)); // 4s, 8s
-                emit_deploy_progress(
-                    app,
-                    "download",
+                on_progress(
                     &format!("{} 第 {} 次重试（{}s 后）...", mirror.name, attempt + 1, delay.as_secs()),
                     base_percent,
                 );
                 tokio::time::sleep(delay).await;
             }
-            match download_from_url(&mirror_url, &tmp, app, base_percent, end_percent).await {
+            match download_from_url(&mirror_url, &tmp, on_progress, base_percent, end_percent).await {
                 Ok(()) => return Ok(tmp),
                 Err(e) => {
                     mirror_err = e;
@@ -2700,6 +2727,57 @@ async fn download_asset(
     }
 
     Err(format!("所有镜像下载均失败，最后错误: {}", last_err))
+}
+
+/// 解析 GitHub 发布包的真实下载地址（插件部署复用，避免各处重复实现）。
+///
+/// 返回 (tag, 下载 URL)。先取版本号（未指定则取 latest），再拉该版本的资产列表做
+/// 精确匹配：资产不存在时给出「这个版本有哪些包」的可读报错，而不是让镜像返回一个
+/// 语焉不详的 404。
+pub(crate) async fn resolve_release_asset(
+    repo: &str,
+    version: Option<&str>,
+    asset_name: &str,
+) -> Result<(String, String), String> {
+    let tag = match version {
+        Some(v) => v.trim().to_string(),
+        None => latest_release_tag(repo).await?,
+    };
+    if tag.is_empty() {
+        return Err(format!("无法解析 {} 的发布版本号", repo));
+    }
+
+    match fetch_release_assets_via_web(repo, &tag).await {
+        Ok(release) => {
+            match release
+                .assets
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(asset_name))
+            {
+                Some(asset) => Ok((tag, asset.browser_download_url.clone())),
+                None => {
+                    let available = release
+                        .assets
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join("、");
+                    Err(format!(
+                        "{} {} 中没有发布包 {}（该版本只有：{}）",
+                        repo, tag, asset_name, available
+                    ))
+                }
+            }
+        }
+        // 资产页解析失败不阻断下载：按 GitHub 的固定 URL 规则拼，HTTP 层错误由镜像重试兜住
+        Err(_) => Ok((
+            tag.clone(),
+            format!(
+                "https://github.com/{}/releases/download/{}/{}",
+                repo, tag, asset_name
+            ),
+        )),
+    }
 }
 
 fn extract_archive(archive_path: &Path, target_dir: &Path) -> Result<(), String> {

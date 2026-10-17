@@ -438,6 +438,23 @@ function renderCpaCredentials(service) {
   }
   container.hidden = false;
 
+  // 凭证区默认折叠（卡片保持精简），用户展开偏好按卡片记忆
+  const foldKey = 'anybridge.pluginCard.cpa-suite.expanded';
+  const foldBtn = document.getElementById('cpa-card-fold-btn');
+  const applyCpaFold = (open) => {
+    container.hidden = !open;
+    if (foldBtn) {
+      foldBtn.classList.toggle('is-open', open);
+      foldBtn.title = open ? '收起详情' : '展开详情';
+      foldBtn.setAttribute('aria-label', foldBtn.title);
+    }
+    try { localStorage.setItem(foldKey, open ? '1' : '0'); } catch (_) {}
+  };
+  let cpaFoldOpen = false;
+  try { cpaFoldOpen = localStorage.getItem(foldKey) === '1'; } catch (_) {}
+  applyCpaFold(cpaFoldOpen);
+  if (foldBtn) foldBtn.onclick = () => applyCpaFold(container.hidden);
+
   const adminEl = document.getElementById('cpa-cred-admin-key');
   const mgmtEl = document.getElementById('cpa-cred-management-key');
   const apiKeyEl = document.getElementById('cpa-cred-api-key');

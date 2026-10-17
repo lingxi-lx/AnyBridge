@@ -539,8 +539,12 @@ pub fn open_url(url: String) -> Result<(), String> {
 fn open_url_internal(url: &str) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW：不隐藏的话每次打开链接都会闪一下 cmd 黑窗
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
         std::process::Command::new("cmd")
-            .args(["/C", "start", url])
+            .args(["/C", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map_err(|e| format!("打开浏览器失败: {}", e))?;
     }

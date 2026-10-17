@@ -1,0 +1,349 @@
+//! 插件发布包获取（GitHub Releases 预编译二进制）。
+//!
+//! 和 CPA（CLIProxyAPI / CPA Manager Plus）走的是同一条链路：
+//!   解析版本 → 并发测速挑最快镜像 → 流式下载（系统代理）→ 逐镜像重试 → 解压 → 就位。
+//! 插件侧只声明「要哪个仓库的哪个产物」，不再各自实现下载。
+//!
+//! 为什么不让 adapter 用 curl 自己下：
+//!   curl.exe 用自带 CA 包，企业网 / 本机代理（Clash 等）中间证书环境下会直接 60 失败；
+//!   Rust 侧 reqwest 走系统代理 + 镜像测速，与 CPA 安装部署在用户机器上的成功路径一致。
+//!
+//! 安装只替换可执行文件：config、凭证目录、数据目录一律不碰。
+
+use std::fs;
+use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
+
+use super::extensions::{self, DownloadProgress};
+
+/// 插件在 plugin.json 的 `deploy.asset` 里声明的发布包规格。
+#[derive(Debug, Clone)]
+pub(crate) struct ReleaseAssetSpec {
+    /// GitHub 仓库，如 Practice019/multi2api
+    pub repo: String,
+    /// 产物名模板，支持 {goos} {goarch} {archive_ext}
+    asset_template: String,
+    /// 可执行文件名模板，支持 {ext}
+    binary_template: String,
+    /// 记录已安装版本的文件名（相对安装目录）
+    version_file: String,
+    /// 解压时剥离的顶层目录层数
+    strip_components: usize,
+}
+
+impl ReleaseAssetSpec {
+    /// manifest.deploy 中声明了 asset 才返回 Some；字段缺失直接报错，不做静默兜底。
+    pub(crate) fn from_deploy(deploy: &serde_json::Value) -> Result<Option<Self>, String> {
+        let Some(asset) = deploy.get("asset") else {
+            return Ok(None);
+        };
+        if asset.is_null() {
+            return Ok(None);
+        }
+
+        let field = |key: &str| -> Result<String, String> {
+            asset
+                .get(key)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| format!("plugin.json 的 deploy.asset.{} 缺失或为空", key))
+        };
+
+        Ok(Some(Self {
+            repo: field("repo")?,
+            asset_template: field("name")?,
+            binary_template: field("binary")?,
+            version_file: asset
+                .get("versionFile")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| ".release-version".to_string()),
+            strip_components: asset
+                .get("stripComponents")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize,
+        }))
+    }
+
+    fn goos() -> &'static str {
+        match std::env::consts::OS {
+            "windows" => "windows",
+            "macos" => "darwin",
+            _ => "linux",
+        }
+    }
+
+    fn goarch() -> &'static str {
+        match std::env::consts::ARCH {
+            "x86_64" => "amd64",
+            "aarch64" => "arm64",
+            "x86" => "386",
+            other => other,
+        }
+    }
+
+    fn exe_ext() -> &'static str {
+        if cfg!(windows) {
+            ".exe"
+        } else {
+            ""
+        }
+    }
+
+    fn archive_ext() -> &'static str {
+        if cfg!(windows) {
+            "zip"
+        } else {
+            "tar.gz"
+        }
+    }
+
+    pub(crate) fn asset_name(&self) -> String {
+        self.asset_template
+            .replace("{goos}", Self::goos())
+            .replace("{goarch}", Self::goarch())
+            .replace("{archive_ext}", Self::archive_ext())
+    }
+
+    pub(crate) fn binary_name(&self) -> String {
+        self.binary_template.replace("{ext}", Self::exe_ext())
+    }
+
+    pub(crate) fn installed_version(&self, install_path: &Path) -> Option<String> {
+        let raw = fs::read_to_string(install_path.join(&self.version_file)).ok()?;
+        let trimmed = raw.trim().to_string();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+
+    fn binary_path(&self, install_path: &Path) -> PathBuf {
+        install_path.join(self.binary_name())
+    }
+}
+
+/// 确保发布包已就位，返回实际安装的版本号。
+///
+/// - `version = None` 表示取最新版本；`force = false` 时若本地已有二进制与版本记录则直接返回。
+/// - 下载进度通过 `progress(message, percent)` 投递，百分比区间 20~85，留给后续配置步骤。
+pub(crate) async fn install(
+    plugin_id: &str,
+    spec: &ReleaseAssetSpec,
+    install_path: &Path,
+    version: Option<&str>,
+    force: bool,
+    progress: DownloadProgress<'_>,
+) -> Result<String, String> {
+    fs::create_dir_all(install_path)
+        .map_err(|e| format!("无法创建安装目录 {}：{}", install_path.display(), e))?;
+
+    // 只有「装最新版」才允许命中已安装直接返回；指定版本时一律按目标版本重新取包
+    if !force && version.is_none() {
+        if let Some(installed) = spec.installed_version(install_path) {
+            if spec.binary_path(install_path).is_file() {
+                progress(&format!("已安装 {}，跳过下载", installed), 85);
+                return Ok(installed);
+            }
+        }
+    }
+
+    let asset_name = spec.asset_name();
+    let (tag, url) = extensions::resolve_release_asset(&spec.repo, version, &asset_name).await?;
+    progress(&format!("准备下载 {}（版本 {}）", asset_name, tag), 20);
+
+    let download_name = format!("anybridge_{}_{}", plugin_id, asset_name);
+    let archive = extensions::download_asset_with(&url, &download_name, progress, 20, 85).await?;
+
+    let result = unpack_binary(plugin_id, spec, install_path, &archive, &tag);
+    let _ = fs::remove_file(&archive);
+    result?;
+
+    progress(&format!("{} 已就位（版本 {}）", spec.binary_name(), tag), 85);
+    Ok(tag)
+}
+
+fn unpack_binary(
+    plugin_id: &str,
+    spec: &ReleaseAssetSpec,
+    install_path: &Path,
+    archive: &Path,
+    tag: &str,
+) -> Result<(), String> {
+    let staging = install_path.join(format!(".{}-staging", plugin_id));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|e| format!("无法清理暂存目录 {}：{}", staging.display(), e))?;
+    }
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("无法创建暂存目录 {}：{}", staging.display(), e))?;
+
+    if let Err(e) = extract_stripped(archive, &staging, spec.strip_components) {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    let staged_bin = staging.join(spec.binary_name());
+    if !staged_bin.is_file() {
+        let listing = list_files(&staging).unwrap_or_else(|_| "（无法列出）".to_string());
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!(
+            "发布包 {} 中没有找到 {}。包内文件：{}",
+            archive
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("archive"),
+            spec.binary_name(),
+            listing
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&staged_bin, fs::Permissions::from_mode(0o755));
+    }
+
+    let target = spec.binary_path(install_path);
+    let replaced = replace_file(&staged_bin, &target);
+    let _ = fs::remove_dir_all(&staging);
+    replaced?;
+
+    fs::write(install_path.join(&spec.version_file), tag)
+        .map_err(|e| format!("无法写入版本记录 {}：{}", spec.version_file, e))?;
+    Ok(())
+}
+
+/// 用 rename 覆盖目标文件。Windows 上进程刚退出时文件句柄释放有延迟，
+/// 这里给一个有限的等待窗口；窗口内让不出来就如实报错，绝不假装替换成功。
+fn replace_file(staged: &Path, target: &Path) -> Result<(), String> {
+    let mut last_err = String::new();
+    for attempt in 0..20u32 {
+        match fs::rename(staged, target) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e.to_string();
+                if attempt < 19 {
+                    std::thread::sleep(Duration::from_millis(500));
+                }
+            }
+        }
+    }
+    Err(format!(
+        "无法替换 {}：{}。若插件仍在运行，请先停止服务再重试。",
+        target.display(),
+        last_err
+    ))
+}
+
+fn list_files(dir: &Path) -> Result<String, String> {
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).map_err(|e| e.to_string())?.flatten() {
+        names.push(entry.file_name().to_string_lossy().to_string());
+    }
+    names.sort();
+    Ok(names.join("、"))
+}
+
+fn extract_stripped(archive: &Path, target: &Path, strip: usize) -> Result<(), String> {
+    let name = archive
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+
+    if name.ends_with(".zip") {
+        extract_zip(archive, target, strip)
+    } else if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
+        extract_tar_gz(archive, target, strip)
+    } else {
+        Err(format!(
+            "不支持的发布包格式：{}（需要 .zip 或 .tar.gz）",
+            archive.display()
+        ))
+    }
+}
+
+/// 去掉路径前 `strip` 层组件；路径本身不足 `strip` 层时返回 None（跳过，如顶层目录条目）。
+/// 含 `..` 或绝对根的条目直接丢弃 —— 解压目标由压缩包内容决定是典型的越界写入。
+fn strip_path(path: &Path, strip: usize) -> Option<PathBuf> {
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => continue,
+            Component::Normal(_) => parts.push(component),
+            // 绝对路径 / 上跳 / Windows 盘符前缀：一律不认
+            _ => return None,
+        }
+    }
+    if parts.len() <= strip {
+        return None;
+    }
+    Some(parts[strip..].iter().collect())
+}
+
+fn extract_zip(archive: &Path, target: &Path, strip: usize) -> Result<(), String> {
+    let file = fs::File::open(archive).map_err(|e| format!("无法打开 zip 包：{}", e))?;
+    let mut zip = zip::ZipArchive::new(file).map_err(|e| format!("无效的 zip 包：{}", e))?;
+
+    for i in 0..zip.len() {
+        let mut entry = zip.by_index(i).map_err(|e| format!("读取 zip 条目失败：{}", e))?;
+        let Some(enclosed) = entry.enclosed_name() else {
+            continue; // 越界路径（../）直接丢弃
+        };
+        let Some(rel) = strip_path(&enclosed, strip) else {
+            continue;
+        };
+        let out = target.join(&rel);
+
+        if entry.is_dir() {
+            fs::create_dir_all(&out).map_err(|e| format!("创建目录失败 {}：{}", out.display(), e))?;
+        } else {
+            if let Some(parent) = out.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("创建目录失败 {}：{}", parent.display(), e))?;
+            }
+            let mut outfile = fs::File::create(&out)
+                .map_err(|e| format!("创建文件失败 {}：{}", out.display(), e))?;
+            std::io::copy(&mut entry, &mut outfile)
+                .map_err(|e| format!("写入文件失败 {}：{}", out.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
+fn extract_tar_gz(archive: &Path, target: &Path, strip: usize) -> Result<(), String> {
+    use flate2::read::GzDecoder;
+
+    let file = fs::File::open(archive).map_err(|e| format!("无法打开 tar.gz 包：{}", e))?;
+    let mut tar = tar::Archive::new(GzDecoder::new(file));
+    let entries = tar.entries().map_err(|e| format!("读取 tar.gz 失败：{}", e))?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| format!("读取 tar.gz 条目失败：{}", e))?;
+        let path = entry
+            .path()
+            .map_err(|e| format!("解析 tar.gz 条目路径失败：{}", e))?
+            .to_path_buf();
+        let Some(rel) = strip_path(&path, strip) else {
+            continue;
+        };
+        let out = target.join(&rel);
+
+        if entry.header().entry_type().is_dir() {
+            fs::create_dir_all(&out).map_err(|e| format!("创建目录失败 {}：{}", out.display(), e))?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("创建目录失败 {}：{}", parent.display(), e))?;
+        }
+        entry
+            .unpack(&out)
+            .map_err(|e| format!("解压文件失败 {}：{}", out.display(), e))?;
+    }
+    Ok(())
+}

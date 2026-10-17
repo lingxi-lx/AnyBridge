@@ -2413,7 +2413,10 @@
                         <p>CLIProxyAPI + CPA Manager Plus + CPA 插件商店，一键部署为本地 AI 网关管理中心。</p>
                       </div>
                     </div>
-                    <span class="extension-status status-pending" id="extension-cpa-status">检测中</span>
+                    <div class="extension-top-side">
+                      <span class="extension-status status-pending" id="extension-cpa-status">检测中</span>
+                      <button type="button" class="extension-fold-btn" id="cpa-card-fold-btn" title="展开详情" aria-label="展开详情"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg></button>
+                    </div>
                   </div>
                   <div class="extension-meta-grid">
                     <div><span>版本</span><strong id="extension-cpa-version">待检测</strong> <span class="extension-update-badge" id="extension-cpa-update-badge" hidden data-action-chain="[{&quot;fn&quot;:&quot;handleExtensionAction&quot;,&quot;args&quot;:[&quot;update-cpa-suite&quot;]}]" data-action="handleExtensionAction" data-stop>有更新</span></div>
@@ -6549,6 +6552,18 @@
                     <label for="cb-edit-default-effort">默认档位 <span class="cb-edit-label-tip">请求档位不在白名单时自动回落到此档，留空则不指定</span></label>
                     <select id="cb-edit-default-effort"></select>
                   </div>
+                  <div id="cb-edit-buddy-thinking-extra" class="cb-edit-form-item" style="display:none;">
+                    <label style="margin-bottom:4px;">思考开关 <span class="cb-edit-label-tip">控制聊天界面是否提供「关闭思考」选项</span></label>
+                    <div class="cb-edit-caps">
+                      <label title="模型只有思考模式：聊天界面不显示「关闭思考」。需同时勾选上方「深度推理」才会生效"><input type="checkbox" id="cb-edit-only-reasoning"> 仅思考模型</label>
+                      <label title="取消勾选后聊天界面不显示「关闭思考」（写入 reasoning.canDisableThinking = false）"><input type="checkbox" id="cb-edit-allow-disable-thinking"> 允许关闭思考</label>
+                    </div>
+                    <label for="cb-edit-reasoning-summary" style="margin-top:8px;">思考摘要 <span class="cb-edit-label-tip">让上游返回思考摘要，官方内置模型统一为自动</span></label>
+                    <select id="cb-edit-reasoning-summary">
+                      <option value="">不指定</option>
+                      <option value="auto">自动</option>
+                    </select>
+                  </div>
                   <div id="cb-edit-reasoning-hint" class="zc-reasoning-hint"></div>
                 </div>
 
@@ -9478,7 +9493,7 @@
 
 <!-- 插件部署对话框（通用，由 plugin.json 驱动） -->
   <div id="plugin-deploy-modal" class="modal-overlay">
-    <div class="modal-container" style="max-width: 620px;">
+    <div class="modal-container plugin-deploy-container">
       <div class="modal-header">
         <div class="modal-title">
           <span class="modal-icon" style="color: var(--accent);">
@@ -9491,19 +9506,31 @@
           </span>
           <span id="plugin-deploy-title">安装插件</span>
         </div>
+        <button type="button" class="modal-close-icon" aria-label="关闭" id="plugin-deploy-close-btn" data-action="closePluginDeployDialog">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
       </div>
 
-      <!-- 确认视图：部署信息 + 策略选择 + 环境预检 -->
-      <div class="modal-body" id="plugin-deploy-confirm-view" style="max-height: 440px; overflow-y: auto;">
+      <!-- 确认视图：部署信息 + 策略选择 + 环境预检（固定高度与内边距，切换时不抖动） -->
+      <div class="modal-body plugin-deploy-view" id="plugin-deploy-confirm-view">
         <div class="plugin-deploy-info" id="plugin-deploy-info"></div>
         <div class="plugin-deploy-strategy" id="plugin-deploy-strategy-row"></div>
         <div class="plugin-deploy-env" id="plugin-deploy-env"></div>
       </div>
 
-      <!-- 进度视图：步骤列表 + 实时日志 -->
-      <div class="modal-body" id="plugin-deploy-progress-view" style="display: none; max-height: 480px; overflow-y: auto;">
-        <div class="plugin-deploy-steps" id="plugin-deploy-steps"></div>
-        <div class="plugin-deploy-log" id="plugin-deploy-log"></div>
+      <!-- 进度视图：进度条 + 步骤胶囊 + 终端日志（同等高度，尺寸绝不忽大忽小） -->
+      <div class="modal-body plugin-deploy-view" id="plugin-deploy-progress-view" style="display: none;">
+        <div class="plugin-deploy-progress-wrap">
+          <div class="plugin-deploy-progress-bar-row">
+            <div class="plugin-deploy-progress-bar-track">
+              <div class="plugin-deploy-progress-bar-fill" id="plugin-deploy-progress-fill" style="width: 0%;"></div>
+            </div>
+            <span class="plugin-deploy-progress-percent" id="plugin-deploy-progress-percent">0%</span>
+          </div>
+          <p class="plugin-deploy-progress-message" id="plugin-deploy-progress-message">准备中...</p>
+          <div class="plugin-deploy-steps" id="plugin-deploy-steps"></div>
+          <div class="plugin-deploy-log" id="plugin-deploy-log"></div>
+        </div>
       </div>
 
       <div class="modal-footer">

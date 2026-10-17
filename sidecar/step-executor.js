@@ -295,6 +295,13 @@ async function executeDeploy({ pluginId, strategy, deployMdContent, installPath,
   };
 
   // Pre-step: handle existing install directory
+  //
+  // 只有真正要跑 shell 命令的策略（source 克隆、docker 构建）才需要干净目录。
+  // 全部步骤都由 adapter 接管的策略（deploy.md 里没有可执行命令）绝不能清目录：
+  // AnyBridge 已经在部署前把发布包/二进制放进去了，清掉之后 adapter 只会报
+  // 「安装目录缺少 xxx.exe」，用户完全看不出是被谁删的。
+  const hasShellSteps = strat.steps.some((s) => Array.isArray(s.commands) && s.commands.length > 0);
+
   if (existsSync(installPath)) {
     const gitDir = join(installPath, '.git');
     if (existsSync(gitDir)) {
@@ -307,7 +314,7 @@ async function executeDeploy({ pluginId, strategy, deployMdContent, installPath,
       // Mark step 1 (Clone) as skipped by removing its commands
       const cloneStep = strat.steps.find(s => /clone/i.test(s.title));
       if (cloneStep) cloneStep.commands = [];
-    } else {
+    } else if (hasShellSteps) {
       // Directory exists but no .git — check if empty
       const entries = await readdir(installPath);
       if (entries.length > 0) {
@@ -320,6 +327,13 @@ async function executeDeploy({ pluginId, strategy, deployMdContent, installPath,
         await rm(installPath, { recursive: true, force: true });
         await mkdir(installPath, { recursive: true });
       }
+    } else {
+      onProgress?.({
+        step: 0,
+        title: 'Pre-check',
+        status: 'done',
+        message: '安装目录由 adapter 接管，保留现有文件'
+      });
     }
   } else {
     await mkdir(installPath, { recursive: true });

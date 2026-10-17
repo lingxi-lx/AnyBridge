@@ -1,11 +1,18 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tauri::{Emitter, State};
 use futures_util::StreamExt;
 
 use crate::commands::config::configured_proxy_ports;
+use crate::commands::plugin_asset::{self, ReleaseAssetSpec};
+use crate::commands::extensions;
+
+/// 插件未声明端口、或配置里缺失端口时的兜底端口。
+/// 刻意不选 8000：它是大量开发服务器（Django / Flask / 各类前端 dev server）
+/// 的默认端口，插件默认占它会跟用户的日常开发撞车。
+const FALLBACK_PORT: u16 = 18763;
 
 // ═══════════════════════════════════════════════════
 // Data types
@@ -37,6 +44,11 @@ pub struct PluginManifest {
     pub deploy: serde_json::Value,
     #[serde(default)]
     pub upgrade: Option<serde_json::Value>,
+    /// 插件自描述的访问凭证（扩展页卡片「访问凭证」区渲染用）。
+    /// 结构由前端约定：[{ subtitle, rows: [{ label, value, copy }] }]，
+    /// value 支持 {port} 与 {config.<key>} 占位符，由前端在渲染时填充。
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
+    pub credentials: serde_json::Value,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +126,94 @@ fn plugin_config_path(plugin_id: &str) -> PathBuf {
 
 fn now_iso() -> String {
     chrono::Utc::now().to_rfc3339()
+}
+
+// ── 供应商自动登记 ─────────────────────────────────────────────────────────
+// 插件部署成功后自动登记成本地供应商，省掉用户手动再填一遍 127.0.0.1:端口 + 密钥。
+// 这与 CPA 套件的做法一致（extensions.rs 的 auto_add_cpa_provider）。
+//
+// 只在插件确实产出了 API 密钥时才登记：没有密钥的插件（靠本机访问免鉴权的）
+// 无从填 api_key，硬登记出一个供应商反而是坏的。
+const PLUGIN_PROVIDER_PREFIX: &str = "plugin-";
+
+fn plugin_provider_id(plugin_id: &str) -> String {
+    format!("{}{}", PLUGIN_PROVIDER_PREFIX, plugin_id)
+}
+
+fn auto_add_plugin_provider(
+    plugin_id: &str,
+    name: &str,
+    port: u16,
+    api_key: &str,
+) -> Result<(), String> {
+    use crate::commands::config::{
+        read_provider_store, write_provider_store, ApiFormat, Provider, ProviderCapabilities,
+    };
+
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        return Ok(());
+    }
+
+    let mut store = read_provider_store()?;
+    let id = plugin_provider_id(plugin_id);
+    let host = format!("http://127.0.0.1:{}", port);
+
+    // 已存在则只同步地址与密钥，不重复插入
+    if let Some(existing) = store.providers.iter_mut().find(|p| p.id == id) {
+        existing.name = name.to_string();
+        existing.api_host = host;
+        existing.api_key = api_key.to_string();
+        if existing.api_path.as_deref().unwrap_or("").trim().is_empty() {
+            existing.api_path = Some("/v1".into());
+        }
+        existing.enabled = true;
+        return write_provider_store(&store);
+    }
+
+    let provider = Provider {
+        id: id.clone(),
+        name: name.to_string(),
+        api_host: host,
+        api_key: api_key.to_string(),
+        api_path: Some("/v1".into()),
+        default_model: String::new(),
+        api_format: ApiFormat::Openai,
+        enabled: true,
+        models: Vec::new(),
+        capabilities: ProviderCapabilities::default(),
+        model_caps: HashMap::new(),
+        unlocks: Default::default(),
+        wire_api: String::new(),
+        route_through_proxy: true,
+        inject_models: true,
+        preserve_official_auth: false,
+        unify_session_history: true,
+        model_catalog: Vec::new(),
+        codex_chat_reasoning: None,
+        agents_config: None,
+        agents: Vec::new(),
+        context_window: None,
+        model_contexts: HashMap::new(),
+        subagent_models: HashMap::new(),
+    };
+
+    store.providers.insert(0, provider);
+    write_provider_store(&store)
+}
+
+fn remove_plugin_provider(plugin_id: &str) -> Result<(), String> {
+    use crate::commands::config::{read_provider_store, write_provider_store};
+
+    let mut store = read_provider_store()?;
+    let before = store.providers.len();
+    let id = plugin_provider_id(plugin_id);
+    // 只删本插件自动登记的那条，不按 host 误删用户自建供应商
+    store.providers.retain(|p| p.id != id);
+    if store.providers.len() != before {
+        write_provider_store(&store)?;
+    }
+    Ok(())
 }
 
 fn read_status(plugin_id: &str) -> PluginStatus {
@@ -316,10 +416,10 @@ pub async fn plugin_set_config(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn plugin_adapter_call(
-    plugin_id: String,
-    method: String,
+/// 把调用转给 sidecar 里的 adapter（内部用，不带 UI 拦截逻辑）。
+async fn adapter_call(
+    plugin_id: &str,
+    method: &str,
     args: Vec<serde_json::Value>,
 ) -> Result<serde_json::Value, String> {
     let body = serde_json::json!({
@@ -335,6 +435,76 @@ pub async fn plugin_adapter_call(
         return Err(response.get("error").and_then(|e| e.as_str()).unwrap_or("Unknown error").to_string());
     }
     Err("Invalid sidecar response".to_string())
+}
+
+#[tauri::command]
+pub async fn plugin_adapter_call(
+    app: tauri::AppHandle,
+    state: State<'_, PluginState>,
+    plugin_id: String,
+    method: String,
+    args: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    // 版本切换要换掉可执行文件：和「更新」一样由 Rust 下载（镜像测速 + 系统代理），
+    // 不落到 sidecar 里用 curl 直连 —— 那是本机代理/企业网环境下失败率最高的做法。
+    if method == "switchVersion" {
+        let manifest = plugin_get_manifest(plugin_id.clone()).await?;
+        if let Some(spec) = ReleaseAssetSpec::from_deploy(&manifest.deploy)? {
+            let version = args
+                .get(1)
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| "请输入目标版本号，例如 v1.8.0".to_string())?;
+            let install_path = read_config(&plugin_id)
+                .get("installPath")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if install_path.is_empty() {
+                return Err("插件尚未安装，缺少 installPath".to_string());
+            }
+
+            // 运行中的进程占着 exe，Windows 上无法覆盖：先停、换完再按原状态拉起来
+            let was_running = matches!(read_status(&plugin_id).state.as_str(), "running" | "starting");
+            if was_running {
+                let _ = plugin_stop(app.clone(), state.clone(), plugin_id.clone()).await;
+            }
+            let installed = match prepare_release_asset(
+                &app,
+                &plugin_id,
+                "adapter",
+                &spec,
+                &install_path,
+                Some(&version),
+                true,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    // 换版本失败：旧二进制还在，先把服务按原样拉回去，别让插件停在停止态
+                    if was_running {
+                        let _ = plugin_start(app.clone(), state.clone(), plugin_id.clone()).await;
+                    }
+                    return Err(e);
+                }
+            };
+            if was_running {
+                let _ = plugin_start(app.clone(), state, plugin_id.clone()).await;
+            }
+            return Ok(serde_json::json!({
+                "version": installed,
+                "message": if was_running {
+                    format!("已切换到 {}，服务已按新版本启动", installed)
+                } else {
+                    format!("已切换到 {}，下次启动生效", installed)
+                },
+            }));
+        }
+    }
+
+    adapter_call(&plugin_id, &method, args).await
 }
 
 #[tauri::command]
@@ -376,6 +546,62 @@ fn emit_deploy_progress(
     );
 }
 
+/// 取插件发布包（预编译二进制）：Rust 侧统一走镜像测速下载，进度投递到部署界面。
+/// 与 CPA 安装部署同一条链路，插件 adapter 因此不必自己实现下载。
+async fn prepare_release_asset(
+    app: &tauri::AppHandle,
+    plugin_id: &str,
+    strategy: &str,
+    spec: &ReleaseAssetSpec,
+    install_path: &str,
+    version: Option<&str>,
+    force: bool,
+) -> Result<String, String> {
+    let target = version.unwrap_or("最新版本");
+    emit_deploy_progress(
+        app,
+        plugin_id,
+        strategy,
+        "download",
+        "running",
+        &format!("获取发布包 {}（{}）...", spec.asset_name(), target),
+        None,
+    );
+
+    let progress = |msg: &str, pct: u8| {
+        emit_deploy_progress(
+            app,
+            plugin_id,
+            strategy,
+            "download",
+            "running",
+            msg,
+            Some(serde_json::json!({ "percent": pct })),
+        );
+    };
+
+    match plugin_asset::install(plugin_id, spec, Path::new(install_path), version, force, &progress)
+        .await
+    {
+        Ok(installed) => {
+            emit_deploy_progress(
+                app,
+                plugin_id,
+                strategy,
+                "download",
+                "done",
+                &format!("发布包已就绪（{}）", installed),
+                Some(serde_json::json!({ "percent": 85 })),
+            );
+            Ok(installed)
+        }
+        Err(e) => {
+            emit_deploy_progress(app, plugin_id, strategy, "download", "error", &e, None);
+            Err(e)
+        }
+    }
+}
+
 /// Run one deployment strategy end to end. Returns the sidecar's result object on success.
 async fn deploy_with_strategy(
     app: &tauri::AppHandle,
@@ -383,6 +609,7 @@ async fn deploy_with_strategy(
     strategy: &str,
     install_path: &str,
     existing_config: &serde_json::Value,
+    default_port: u16,
 ) -> Result<serde_json::Value, String> {
     // 1. Environment check for this specific strategy
     emit_deploy_progress(
@@ -450,9 +677,12 @@ async fn deploy_with_strategy(
             }
         }
     }
+    // 端口默认值由调用方从插件声明的 configSchema 取来。安装向导在点「安装」前
+    // 并不保存配置，所以这里填的就是本次安装真正生效的端口 —— 必须与表单里显示
+    // 的默认值同源，否则会出现「表单显示 7863、实际跑 8000」。
     config_values
         .entry("port".to_string())
-        .or_insert(serde_json::json!(8000));
+        .or_insert(serde_json::json!(default_port));
 
     let deploy_body = serde_json::json!({
         "pluginId": plugin_id,
@@ -622,11 +852,25 @@ pub async fn plugin_deploy(
             p.to_string_lossy().to_string()
         });
 
+    // 端口默认值取自插件自己声明的 configSchema。安装向导在点「安装」前并不保存
+    // 配置，所以这里填的就是本次安装真正生效的端口 —— 必须与表单里显示的默认值
+    // 同源，否则会出现「表单显示 7863、实际跑 8000」。
+    //
+    // 兜底值刻意不落 8000：它是大量开发服务器（Django / Flask / 各类前端 dev
+    // server）的默认端口，插件默认占它会跟用户的日常开发撞车。
+    let default_port = manifest
+        .config_schema
+        .iter()
+        .find(|f| f.get("key").and_then(|k| k.as_str()) == Some("port"))
+        .and_then(|f| f.get("default"))
+        .and_then(|d| d.as_u64())
+        .unwrap_or(FALLBACK_PORT as u64) as u16;
+
     // Port conflict check before doing any expensive work
     let port = existing_config
         .get("port")
         .and_then(|v| v.as_u64())
-        .unwrap_or(8000) as u16;
+        .unwrap_or(default_port as u64) as u16;
     if is_port_in_use(port) {
         let msg = format!("端口 {} 已被占用，请先在配置中更换端口再安装", port);
         emit_deploy_progress(&app, &plugin_id, "", "port-check", "error", &msg, None);
@@ -642,11 +886,29 @@ pub async fn plugin_deploy(
     write_status(&status)?;
     emit_status(&app, &status);
 
+    // 发布包在策略之前统一获取：两种策略装的是同一份二进制，放到这里就不会各写一遍下载。
+    // 已就位时（重装 / 续装）直接跳过，不重复下载。
+    if let Some(spec) = ReleaseAssetSpec::from_deploy(&manifest.deploy)? {
+        let strategy = candidates.first().cloned().unwrap_or_default();
+        if let Err(e) =
+            prepare_release_asset(&app, &plugin_id, &strategy, &spec, &install_path, None, false)
+                .await
+        {
+            let mut status = read_status(&plugin_id);
+            status.state = "error".to_string();
+            status.error = Some(e.clone());
+            status.updated_at = now_iso();
+            let _ = write_status(&status);
+            emit_status(&app, &status);
+            return Err(e);
+        }
+    }
+
     let total = candidates.len();
     let mut last_error = String::new();
 
     for (idx, strat) in candidates.iter().enumerate() {
-        match deploy_with_strategy(&app, &plugin_id, strat, &install_path, &existing_config).await {
+        match deploy_with_strategy(&app, &plugin_id, strat, &install_path, &existing_config, default_port).await {
             Ok(result_obj) => {
                 // Persist config values (secrets, install path, generated config file path)
                 let config_values = result_obj
@@ -675,6 +937,48 @@ pub async fn plugin_deploy(
                     }
                 }
                 write_config(&plugin_id, &saved_config)?;
+
+                // 部署成功即登记为本地供应商：没有密钥就不登记（无从填 api_key）
+                let api_key = saved_config
+                    .get("apiKey")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let effective_port = saved_config
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(default_port as u64) as u16;
+                if !api_key.trim().is_empty() {
+                    emit_deploy_progress(
+                        &app,
+                        &plugin_id,
+                        strat,
+                        "add-provider",
+                        "running",
+                        "注册本地供应商...",
+                        None,
+                    );
+                    match auto_add_plugin_provider(&plugin_id, &manifest.name, effective_port, &api_key) {
+                        Ok(()) => emit_deploy_progress(
+                            &app,
+                            &plugin_id,
+                            strat,
+                            "add-provider",
+                            "done",
+                            "本地供应商已注册",
+                            None,
+                        ),
+                        Err(e) => emit_deploy_progress(
+                            &app,
+                            &plugin_id,
+                            strat,
+                            "add-provider",
+                            "error",
+                            &format!("供应商注册失败：{}", e),
+                            None,
+                        ),
+                    }
+                }
 
                 emit_deploy_progress(
                     &app,
@@ -747,7 +1051,7 @@ pub async fn plugin_start(
     let port = config
         .get("port")
         .and_then(|v| v.as_u64())
-        .unwrap_or(8000) as u16;
+        .unwrap_or(FALLBACK_PORT as u64) as u16;
 
     // Reject a start that would collide with an already-bound port. If our own plugin
     // process is still alive we surface that instead of a generic conflict message.
@@ -762,9 +1066,9 @@ pub async fn plugin_start(
     }
 
     // Get start command from adapter
-    let start_info = plugin_adapter_call(
-        plugin_id.clone(),
-        "prepareStart".to_string(),
+    let start_info = adapter_call(
+        &plugin_id,
+        "prepareStart",
         vec![serde_json::json!(install_path), config.clone()],
     )
     .await?;
@@ -960,9 +1264,9 @@ async fn do_health_check(plugin_id: &str, manifest: &PluginManifest, port: u16) 
     // custom → delegate to adapter.healthCheck()
     if check_type == "custom" {
         let config = read_config(plugin_id);
-        return match plugin_adapter_call(
-            plugin_id.to_string(),
-            "healthCheck".to_string(),
+        return match adapter_call(
+            plugin_id,
+            "healthCheck",
             vec![serde_json::json!(port), config],
         )
         .await
@@ -1035,9 +1339,9 @@ pub async fn plugin_stop(
     let config = read_config(&plugin_id);
     let install_path = config.get("installPath").and_then(|v| v.as_str()).unwrap_or("");
     let stop_info = if !install_path.is_empty() {
-        plugin_adapter_call(
-            plugin_id.clone(),
-            "prepareStop".to_string(),
+        adapter_call(
+            &plugin_id,
+            "prepareStop",
             vec![serde_json::json!(install_path), config.clone()],
         )
         .await
@@ -1122,7 +1426,7 @@ pub async fn plugin_restart(
     plugin_stop(app.clone(), state.clone(), plugin_id.clone()).await?;
 
     // Poll for port release instead of a fixed 1s sleep — TCP TIME_WAIT can take longer
-    let port = read_config(&plugin_id).get("port").and_then(|v| v.as_u64()).unwrap_or(8000) as u16;
+    let port = read_config(&plugin_id).get("port").and_then(|v| v.as_u64()).unwrap_or(FALLBACK_PORT as u64) as u16;
     for _ in 0..30 {
         if !is_port_in_use(port) { break; }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1137,7 +1441,7 @@ pub async fn plugin_health_check(plugin_id: String) -> Result<serde_json::Value,
     let port = config
         .get("port")
         .and_then(|v| v.as_u64())
-        .unwrap_or(8000) as u16;
+        .unwrap_or(FALLBACK_PORT as u64) as u16;
 
     let manifest = plugin_get_manifest(plugin_id.clone()).await?;
     Ok(do_health_check(&plugin_id, &manifest, port).await)
@@ -1215,22 +1519,66 @@ pub async fn plugin_uninstall(
         .get("installPath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let port = config
+        .get("port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(FALLBACK_PORT as u64) as u16;
+
+    // status.json 里的 pid 可能缺失或过期（例如服务是在 AnyBridge 之外被启动的），
+    // plugin_stop 杀不到它。按监听端口把进程找出来杀掉 —— 否则 Windows 上被锁住的
+    // exe 会让目录删不掉，卸载变成"假成功"，卡片以「已停止」复活。
+    if let Some(pid) = extensions::pid_listening_on_port(port) {
+        kill_pid(pid);
+    }
+    for _ in 0..20 {
+        if !is_port_in_use(port) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // 删除目录：进程刚死时句柄释放有延迟，给一个有限的等待窗口；
+    // 窗口内仍删不掉就如实报错 —— 绝不返回"已成功卸载"却留下一地残骸。
+    let remove_dir_with_retry = |dir: &Path| -> Result<(), String> {
+        let mut last_err = String::new();
+        for attempt in 0..10u32 {
+            match fs::remove_dir_all(dir) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    last_err = e.to_string();
+                    if attempt < 9 {
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "无法删除 {}：{}。请确认插件服务已停止（可能被其它程序占用）后重试。",
+            dir.display(),
+            last_err
+        ))
+    };
 
     if !install_path.is_empty() {
-        let _ = plugin_adapter_call(
-            plugin_id.clone(),
-            "prepareUninstall".to_string(),
+        let _ = adapter_call(
+            &plugin_id,
+            "prepareUninstall",
             vec![serde_json::json!(install_path), config.clone()],
         )
         .await;
 
         // Delete install directory
-        let _ = fs::remove_dir_all(install_path);
+        remove_dir_with_retry(Path::new(install_path))?;
     }
 
     // Delete data directory
     let data_dir = plugin_data_dir(&plugin_id);
-    let _ = fs::remove_dir_all(&data_dir);
+    remove_dir_with_retry(&data_dir)?;
+
+    // 一并撤掉部署时自动登记的供应商，避免留下一条指向已删服务的死条目
+    if let Err(e) = remove_plugin_provider(&plugin_id) {
+        eprintln!("[plugins] 移除插件供应商失败 {}: {}", plugin_id, e);
+    }
 
     let status = PluginStatus {
         plugin_id: plugin_id.clone(),
@@ -1255,6 +1603,39 @@ pub async fn plugin_check_update(plugin_id: String) -> Result<serde_json::Value,
         .get("installPath")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    // 声明了发布包规格的插件由 Rust 直接对 GitHub 判版本：
+    // 不再让 sidecar 用 curl 走一遍（curl 的 CA 包与本机代理常见证书冲突）。
+    if !install_path.is_empty() {
+        let manifest = plugin_get_manifest(plugin_id.clone()).await?;
+        if let Some(spec) = ReleaseAssetSpec::from_deploy(&manifest.deploy)? {
+            let latest = extensions::latest_release_tag(&spec.repo)
+                .await
+                .map_err(|e| format!("检查更新失败：{}", e))?;
+            let current = spec.installed_version(Path::new(install_path));
+            return Ok(match current {
+                None => serde_json::json!({
+                    "hasUpdate": true,
+                    "currentVersion": "",
+                    "latestVersion": latest,
+                    "message": format!("本地未记录版本，建议更新到 {}", latest),
+                }),
+                Some(v) if v == latest => serde_json::json!({
+                    "hasUpdate": false,
+                    "currentVersion": v,
+                    "latestVersion": latest,
+                    "message": format!("已是最新版本（{}）", latest),
+                }),
+                Some(v) => serde_json::json!({
+                    "hasUpdate": true,
+                    "currentVersion": v,
+                    "latestVersion": latest,
+                    "message": format!("发现新版本（{} → {}）", v, latest),
+                }),
+            });
+        }
+    }
+
     let body = serde_json::json!({
         "pluginId": plugin_id,
         "installPath": install_path,
@@ -1290,7 +1671,21 @@ pub async fn plugin_upgrade(
         let _ = plugin_stop(app.clone(), state.clone(), plugin_id.clone()).await;
     }
 
-    // 2. 调用 sidecar 执行更新
+    // 2. 先换二进制：Rust 走镜像测速下载，与 CPA 安装部署同一条链路
+    let manifest = plugin_get_manifest(plugin_id.clone()).await?;
+    if let Some(spec) = ReleaseAssetSpec::from_deploy(&manifest.deploy)? {
+        if let Err(e) =
+            prepare_release_asset(&app, &plugin_id, "adapter", &spec, install_path, None, true).await
+        {
+            // 二进制没换成功：旧版本还在磁盘上，把服务拉回去，别让用户以为插件坏了
+            if was_running {
+                let _ = plugin_start(app.clone(), state.clone(), plugin_id.clone()).await;
+            }
+            return Err(format!("更新失败：{}", e));
+        }
+    }
+
+    // 3. 调用 sidecar 收尾（adapter 自己声明的更新动作）
     let body = serde_json::json!({
         "pluginId": plugin_id,
         "installPath": install_path,
@@ -1355,9 +1750,9 @@ pub async fn plugin_generate_config(
     install_path: String,
 ) -> Result<String, String> {
     let config = read_config(&plugin_id);
-    let result = plugin_adapter_call(
-        plugin_id.clone(),
-        "generateConfig".to_string(),
+    let result = adapter_call(
+        &plugin_id,
+        "generateConfig",
         vec![config.clone(), serde_json::json!(install_path)],
     )
     .await?;

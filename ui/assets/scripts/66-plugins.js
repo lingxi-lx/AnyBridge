@@ -333,7 +333,9 @@ function renderInstalledPluginCard(plugin, config = {}) {
         <p>${manifest.description || '即梦多账号 API 网关，兼容 OpenAI 图像与视频接口，支持多账号池轮询。'}</p>
       </div>
     </div>
-    <span class="extension-status status-${meta.cls}" id="installed-card-status-${manifest.id}">${meta.label}</span>
+    <div class="extension-top-side">
+      <span class="extension-status status-${meta.cls}" id="installed-card-status-${manifest.id}">${meta.label}</span>
+    </div>
   `;
 
   // 2. 属性网格（2x2 对称四格：左版本、右端口、左安装目录、右组件运行状态）
@@ -442,37 +444,62 @@ function renderInstalledPluginCard(plugin, config = {}) {
   actions.appendChild(secActions);
 
   // 7. 访问凭证卡片（完全采用 CPA 规格的 .cpa-credentials 结构）
+  //    插件可在 manifest.credentials 里自描述：[{ subtitle, rows: [{ label, value, copy }] }]，
+  //    value 支持 {port} 与 {config.<key>} 占位符；未声明时回落到 Jimeng 的历史文案。
   const creds = document.createElement('div');
   creds.className = 'cpa-credentials';
 
-  const apiKeyHint = '网页 sessionid 或控制台创建的 jm_... 密钥';
+  const escCred = (s) => String(s ?? '')
+    .replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const fillCred = (s) => escCred(String(s ?? ''))
+    .replaceAll('{port}', port)
+    .replace(/\{config\.(\w+)\}/g, (_, k) => escCred(config?.[k] ?? ''));
 
-  creds.innerHTML = `
-    <div class="cpa-credentials-title">访问凭证 <span class="cpa-credentials-hint">点击即可复制</span></div>
+  if (Array.isArray(manifest.credentials) && manifest.credentials.length) {
+    let html = `<div class="cpa-credentials-title">访问凭证 <span class="cpa-credentials-hint">点击即可复制</span></div>`;
+    for (const grp of manifest.credentials) {
+      html += `<div class="cpa-credentials-subtitle">${fillCred(grp.subtitle)}</div>`;
+      for (const row of grp.rows || []) {
+        const val = fillCred(row.value ?? '');
+        const copyBtn = row.copy
+          ? `<button type="button" class="cpa-credential-copy" data-copy-url="${val}" title="复制">复制</button>`
+          : '';
+        html += `<div class="cpa-credential-row${row.copy ? ' cpa-credential-row-link' : ''}">` +
+          `<span class="cpa-credential-label">${escCred(row.label ?? '')}</span>` +
+          `<code class="cpa-credential-value">${val}</code>${copyBtn}</div>`;
+      }
+    }
+    creds.innerHTML = html;
+  } else {
+    const apiKeyHint = '网页 sessionid 或控制台创建的 jm_... 密钥';
 
-    <div class="cpa-credentials-subtitle">Jimeng API (OpenAI 兼容)</div>
-    <div class="cpa-credential-row">
-      <span class="cpa-credential-label">API Key</span>
-      <code class="cpa-credential-value">${apiKeyHint}</code>
-      <button type="button" class="cpa-credential-copy" data-copy-text="${apiKeyHint}">复制</button>
-    </div>
-    <div class="cpa-credential-row cpa-credential-row-link">
-      <span class="cpa-credential-label">API 地址</span>
-      <code class="cpa-credential-value">http://127.0.0.1:${port}/v1</code>
-      <button type="button" class="cpa-credential-copy" data-copy-url="http://127.0.0.1:${port}/v1">复制</button>
-    </div>
+    creds.innerHTML = `
+      <div class="cpa-credentials-title">访问凭证 <span class="cpa-credentials-hint">点击即可复制</span></div>
 
-    <div class="cpa-credentials-subtitle">Jimeng 管理面板</div>
-    <div class="cpa-credential-row">
-      <span class="cpa-credential-label">访问模式</span>
-      <code class="cpa-credential-value" style="color: var(--success); font-weight: 600;">本地免密直达（点击打开面板直接进入）</code>
-    </div>
-    <div class="cpa-credential-row cpa-credential-row-link">
-      <span class="cpa-credential-label">面板地址</span>
-      <code class="cpa-credential-value">http://127.0.0.1:${port}</code>
-      <button type="button" class="cpa-credential-copy" data-copy-url="http://127.0.0.1:${port}">复制</button>
-    </div>
-  `;
+      <div class="cpa-credentials-subtitle">Jimeng API (OpenAI 兼容)</div>
+      <div class="cpa-credential-row">
+        <span class="cpa-credential-label">API Key</span>
+        <code class="cpa-credential-value">${apiKeyHint}</code>
+        <button type="button" class="cpa-credential-copy" data-copy-text="${apiKeyHint}">复制</button>
+      </div>
+      <div class="cpa-credential-row cpa-credential-row-link">
+        <span class="cpa-credential-label">API 地址</span>
+        <code class="cpa-credential-value">http://127.0.0.1:${port}/v1</code>
+        <button type="button" class="cpa-credential-copy" data-copy-url="http://127.0.0.1:${port}/v1">复制</button>
+      </div>
+
+      <div class="cpa-credentials-subtitle">Jimeng 管理面板</div>
+      <div class="cpa-credential-row">
+        <span class="cpa-credential-label">访问模式</span>
+        <code class="cpa-credential-value" style="color: var(--success); font-weight: 600;">本地免密直达（点击打开面板直接进入）</code>
+      </div>
+      <div class="cpa-credential-row cpa-credential-row-link">
+        <span class="cpa-credential-label">面板地址</span>
+        <code class="cpa-credential-value">http://127.0.0.1:${port}</code>
+        <button type="button" class="cpa-credential-copy" data-copy-url="http://127.0.0.1:${port}">复制</button>
+      </div>
+    `;
+  }
 
   // 复制按钮行内已复制反馈（与 CPA 完全一致，无多余浮动 toast）
   creds.querySelectorAll('.cpa-credential-copy').forEach(btn => {
@@ -493,6 +520,28 @@ function renderInstalledPluginCard(plugin, config = {}) {
 
   const updateBadge = metaGrid.querySelector('[data-action="upgradePlugin"]');
   if (updateBadge) updateBadge.addEventListener('click', () => upgradePlugin(manifest.id));
+
+  // 8. 详情折叠：默认精简（凭证区收起），展开偏好按插件记忆
+  const foldKey = `anybridge.pluginCard.${manifest.id}.expanded`;
+  let credsExpanded = false;
+  try { credsExpanded = localStorage.getItem(foldKey) === '1'; } catch (_) {}
+  creds.hidden = !credsExpanded;
+
+  const foldBtn = document.createElement('button');
+  foldBtn.type = 'button';
+  foldBtn.className = 'extension-fold-btn' + (credsExpanded ? ' is-open' : '');
+  foldBtn.title = credsExpanded ? '收起详情' : '展开详情';
+  foldBtn.setAttribute('aria-label', foldBtn.title);
+  foldBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="6 9 12 15 18 9"/></svg>';
+  foldBtn.onclick = () => {
+    const open = creds.hidden;
+    creds.hidden = !open;
+    foldBtn.classList.toggle('is-open', open);
+    foldBtn.title = open ? '收起详情' : '展开详情';
+    foldBtn.setAttribute('aria-label', foldBtn.title);
+    try { localStorage.setItem(foldKey, open ? '1' : '0'); } catch (_) {}
+  };
+  top.querySelector('.extension-top-side')?.appendChild(foldBtn);
 
   card.append(top, metaGrid, alertEl, progressWrap, tags, actions, creds);
   return card;
@@ -915,9 +964,18 @@ async function openPluginDeployDialog(pluginId) {
   addInfo('项目地址', manifest.homepage);
 
   const stepsEl = document.getElementById('plugin-deploy-steps');
-  stepsEl.replaceChildren();
+  initDeploySteps(stepsEl);
   const logEl = document.getElementById('plugin-deploy-log');
-  logEl.replaceChildren();
+  if (logEl) logEl.replaceChildren();
+  lastDeployLogMessage = '';
+
+  // 重置进度条与文案
+  const progressFill = document.getElementById('plugin-deploy-progress-fill');
+  const progressPct = document.getElementById('plugin-deploy-progress-percent');
+  const progressMsg = document.getElementById('plugin-deploy-progress-message');
+  if (progressFill) progressFill.style.width = '0%';
+  if (progressPct) progressPct.textContent = '0%';
+  if (progressMsg) progressMsg.textContent = '正在准备部署...';
 
   const confirmView = document.getElementById('plugin-deploy-confirm-view');
   const progressView = document.getElementById('plugin-deploy-progress-view');
@@ -926,6 +984,8 @@ async function openPluginDeployDialog(pluginId) {
 
   const okBtn = document.getElementById('plugin-deploy-confirm-btn');
   const cancelBtn = document.getElementById('plugin-deploy-cancel-btn');
+  const closeBtn = document.getElementById('plugin-deploy-close-btn');
+  if (closeBtn) closeBtn.onclick = () => modal.classList.remove('active');
   okBtn.disabled = false;
   okBtn.textContent = '开始安装';
 
@@ -994,7 +1054,13 @@ async function openPluginDeployDialog(pluginId) {
       const deployArgs = { pluginId };
       if (selectedStrategy) deployArgs.strategy = selectedStrategy;
       await pluginInvoke('plugin_deploy', deployArgs);
-      appendDeployLog(logEl, 'ok', '部署完成');
+      appendDeployLog(logEl, 'ok', '部署完成，服务已就绪');
+      if (stepsEl) {
+        stepsEl.querySelectorAll('.plugin-deploy-step').forEach(s => { s.dataset.status = 'done'; });
+      }
+      if (progressFill) progressFill.style.width = '100%';
+      if (progressPct) progressPct.textContent = '100%';
+      if (progressMsg) progressMsg.textContent = `${manifest.name || pluginId} 部署完成，准备就绪`;
       pluginNotify(`${manifest.name || pluginId} 部署完成`, 'ok');
       okBtn.disabled = false;
       okBtn.textContent = '完成并启动';
@@ -1004,6 +1070,11 @@ async function openPluginDeployDialog(pluginId) {
       };
     } catch (e) {
       appendDeployLog(logEl, 'err', String(e));
+      if (stepsEl) {
+        const running = stepsEl.querySelector('.plugin-deploy-step[data-status="running"]');
+        if (running) running.dataset.status = 'error';
+      }
+      if (progressMsg) progressMsg.textContent = `部署失败: ${e}`;
       pluginNotify(`部署失败: ${e}`, 'error');
       okBtn.disabled = false;
       okBtn.textContent = '重试';
@@ -1020,44 +1091,130 @@ function closePluginDeployDialog() {
   if (modal) modal.classList.remove('active');
 }
 
+// ── 部署阶段（固定 4 阶段，对齐 CPA，绝不产生零碎胶囊）──
+const DEPLOY_STAGES = [
+  { id: 'env', label: '环境检测' },
+  { id: 'asset', label: '获取组件' },
+  { id: 'config', label: '生成配置' },
+  { id: 'ready', label: '就绪完成' }
+];
+
+function initDeploySteps(stepsEl) {
+  if (!stepsEl) return;
+  stepsEl.innerHTML = DEPLOY_STAGES.map(s => `
+    <div class="plugin-deploy-step" data-stage="${s.id}" data-status="pending">
+      <span class="plugin-deploy-step-icon"></span>
+      <span class="plugin-deploy-step-label">${s.label}</span>
+    </div>
+  `).join('');
+}
+
+function mapStepToStage(key, title) {
+  const sk = String(key || '').toLowerCase();
+  const st = String(title || '').toLowerCase();
+  if (sk === 'deploy-done' || st.includes('部署完成') || st.includes('完成')) return 'ready';
+  if (sk === 'check-environment' || sk === 'port-check' || st.includes('环境') || st.includes('端口')) return 'env';
+  if (sk === 'download' || sk === 'fetch' || st.includes('发布包') || st.includes('下载') || st.includes('clone') || st.includes('解压')) return 'asset';
+  if (sk === 'config' || sk === 'deploy' || sk === 'add-provider' || st.includes('配置') || st.includes('供应商') || st.includes('编译') || st.includes('依赖') || st.includes('安装')) return 'config';
+  return 'config';
+}
+
+function updateDeployStage(stepsEl, activeStageId, status) {
+  if (!stepsEl) return;
+  const stageIds = DEPLOY_STAGES.map(s => s.id);
+  const activeIndex = stageIds.indexOf(activeStageId);
+  if (activeIndex === -1) return;
+
+  stageIds.forEach((id, idx) => {
+    const el = stepsEl.querySelector(`[data-stage="${id}"]`);
+    if (!el) return;
+    if (idx < activeIndex) {
+      el.dataset.status = 'done';
+    } else if (idx === activeIndex) {
+      if (status === 'error') el.dataset.status = 'error';
+      else if (status === 'done' && id === 'ready') el.dataset.status = 'done';
+      else el.dataset.status = 'running';
+    } else {
+      el.dataset.status = 'pending';
+    }
+  });
+}
+
+let lastDeployLogMessage = '';
+
 function appendDeployLog(logEl, level, message) {
   if (!logEl || !message) return;
+  const trimmed = String(message).trim();
+  if (!trimmed) return;
+
+  // 过滤内部跳过与空跑噪声，保持日志清爽有干货
+  if (trimmed.includes('无 shell 命令，跳过')) return;
+  if (/^pre-check/i.test(trimmed)) return;
+
+  // 相邻完全相同的信息去重（防止“部署完成”等连刷两次）
+  if (trimmed === lastDeployLogMessage) return;
+  lastDeployLogMessage = trimmed;
+
   const line = document.createElement('div');
   line.className = `plugin-deploy-log-line level-${level}`;
   const time = document.createElement('span');
   time.className = 'plugin-deploy-log-time';
   time.textContent = new Date().toLocaleTimeString();
   const text = document.createElement('span');
-  text.textContent = message;
+  text.textContent = trimmed;
   line.append(time, text);
   logEl.appendChild(line);
   logEl.scrollTop = logEl.scrollHeight;
 }
 
-/** 部署进度事件 → 步骤列表 + 日志。步骤由事件动态出现，不预设步骤名。 */
+/** 根据部署事件估算进度百分比，确保进度条平滑递增 */
+function estimateDeployPercent(key, title, status) {
+  const sk = String(key || '').toLowerCase();
+  const st = String(title || '').toLowerCase();
+  if (sk === 'deploy-done' || st.includes('完成')) return 100;
+  if (sk === 'add-provider' || st.includes('供应商')) return status === 'done' ? 95 : 90;
+  if (sk === 'config' || st.includes('配置')) return status === 'done' ? 88 : 75;
+  if (sk === 'download' || st.includes('发布包') || st.includes('下载')) return status === 'done' ? 65 : 45;
+  if (sk === 'check-environment' || st.includes('环境')) return status === 'done' ? 25 : 10;
+  return null;
+}
+
+/** 部署进度事件 → 进度条 + 步骤阶段 + 日志。 */
 function handleDeployProgress(payload) {
   const stepsEl = document.getElementById('plugin-deploy-steps');
   const logEl = document.getElementById('plugin-deploy-log');
+  const progressFill = document.getElementById('plugin-deploy-progress-fill');
+  const progressPct = document.getElementById('plugin-deploy-progress-percent');
+  const progressMsg = document.getElementById('plugin-deploy-progress-message');
   if (!payload) return;
 
   const key = String(payload.step ?? '');
   const label = payload.title || stepLabelFor(key);
-  if (stepsEl && key) {
-    let row = stepsEl.querySelector(`[data-step="${CSS.escape(key)}"]`);
-    if (!row) {
-      row = document.createElement('div');
-      row.className = 'plugin-deploy-step';
-      row.dataset.step = key;
-      const icon = document.createElement('span');
-      icon.className = 'plugin-deploy-step-icon';
-      const text = document.createElement('span');
-      text.className = 'plugin-deploy-step-label';
-      row.append(icon, text);
-      stepsEl.appendChild(row);
-    }
-    row.querySelector('.plugin-deploy-step-label').textContent = label;
-    row.dataset.status = payload.status || 'running';
+
+  // 更新进度条：后端给了真实百分比（如下载进度）就以它为准，否则按步骤估算
+  const backendPercent = payload.details && typeof payload.details.percent === 'number'
+    ? payload.details.percent
+    : null;
+  const pTarget = backendPercent === null
+    ? estimateDeployPercent(key, payload.title, payload.status)
+    : backendPercent;
+  if (typeof pTarget === 'number' && progressFill && progressPct) {
+    const cur = parseInt(progressPct.textContent, 10) || 0;
+    const next = Math.max(cur, Math.min(100, pTarget));
+    progressFill.style.width = `${next}%`;
+    progressPct.textContent = `${next}%`;
   }
+  if (progressMsg && (payload.message || label)) {
+    // 过滤无意义的内部跳过文案作为主提示
+    const cleanMsg = String(payload.message || label).trim();
+    if (!cleanMsg.includes('无 shell 命令，跳过') && !/^pre-check/i.test(cleanMsg)) {
+      progressMsg.textContent = cleanMsg;
+    }
+  }
+
+  // 更新固定 4 阶段指示器
+  const stage = mapStepToStage(key, payload.title);
+  updateDeployStage(stepsEl, stage, payload.status);
 
   const level = payload.status === 'error' ? 'err' : payload.status === 'done' ? 'ok' : 'info';
   appendDeployLog(logEl, level, payload.message);
@@ -1070,8 +1227,10 @@ function stepLabelFor(key) {
   const map = {
     'check-environment': '检测环境',
     'environment-ok': '环境就绪',
+    download: '获取发布包',
     deploy: '执行部署',
     config: '生成配置',
+    'add-provider': '注册供应商',
     'deploy-done': '部署完成',
     fallback: '策略降级',
     'port-check': '端口检查',

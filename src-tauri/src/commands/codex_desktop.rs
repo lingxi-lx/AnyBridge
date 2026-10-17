@@ -23,8 +23,9 @@
 
 use crate::commands::config::{configured_proxy_ports, read_provider_store, ModelCatalogEntry};
 use crate::commands::platforms::{
-    codex_bundled_model_template, codex_home, generate_model_catalog_json, is_codex_bundled_model,
-    read_codex_model_template, resolve_codex_model_catalog_entries, CODEX_MODEL_CATALOG_FILENAME,
+    catalog_entry_has_required_fields, codex_bundled_model_template, codex_home,
+    generate_model_catalog_json, is_codex_bundled_model, read_codex_model_template,
+    resolve_codex_model_catalog_entries, CODEX_MODEL_CATALOG_FILENAME,
 };
 use serde::Serialize;
 use std::collections::HashSet;
@@ -628,7 +629,14 @@ fn ensure_anybridge_catalog_file(dir: &std::path::Path) -> Result<PathBuf, Strin
         Ok(raw) => {
             let parsed = serde_json::from_str::<serde_json::Value>(&raw).ok();
             match parsed.as_ref().and_then(catalog_models_array) {
-                Some(arr) => !arr.iter().any(|m| extract_model_slug(m).is_some()),
+                Some(arr) => {
+                    // 旧版 AnyBridge 生成的 catalog 可能缺 base_instructions 等
+                    // Codex 0.146+ 必填字段，这类文件会让 `codex` 启动直接报
+                    // `missing field`，必须重建，不能继续沿用。
+                    arr.is_empty()
+                        || !arr.iter().any(|m| extract_model_slug(m).is_some())
+                        || arr.iter().any(|m| !catalog_entry_has_required_fields(m))
+                }
                 None => true,
             }
         }

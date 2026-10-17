@@ -53,7 +53,7 @@ cd backend && go build -o ../grok2api ./cmd/grok2api && cd ..
 #### 4. Config
 AnyBridge will auto-generate config.yaml via adapter.js generateConfig().
 The config includes:
-- port: {config.port} (default: 8000)
+- port: {config.port} (default: 8700)
 - adminPassword: auto-generated
 - jwtSecret: auto-generated (32-char hex)
 - encryptionKey: auto-generated (base64 32 bytes)

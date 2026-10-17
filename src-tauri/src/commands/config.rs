@@ -1532,7 +1532,7 @@ fn regex_match(pattern: &str, text: &str) -> bool {
 fn vision_missing_reason(text: &str) -> Option<&'static str> {
     let lower = text.trim().to_ascii_lowercase();
     if regex_match(
-        r#"(?m)^\s*["“”「」']?(?:我)?不能看到图片["“”「」']?[。.!！]?\s*$"#,
+        r#"(?m)^\s*["""「」']?(?:我)?不能看到图片["""「」']?[。.!！]?\s*$"#,
         text,
     ) {
         return Some("模型明确回答不能看到图片");
@@ -1573,7 +1573,7 @@ fn vision_missing_reason(text: &str) -> Option<&'static str> {
 
 fn vision_seen_answer_ok(text: &str) -> bool {
     regex_match(
-        r#"(?m)^\s*["“”「」']?(?:我)?能看到图片["“”「」']?[。.!！,，]?\s*(?:$|图片内容|内容)"#,
+        r#"(?m)^\s*["""「」']?(?:我)?能看到图片["""「」']?[。.!！,，]?\s*(?:$|图片内容|内容)"#,
         text,
     )
 }
@@ -2295,7 +2295,18 @@ pub async fn fetch_models(args: FetchModelsArgs) -> Result<FetchModelsResult, St
         } else {
             attempts.join("；")
         };
-        return Err(format!("模型列表拉取失败：{}", detail));
+        // 本机网关拉不到时，最常见原因是插件服务没启动（端口无人监听，
+        // 代理层会把连接失败转成 502/网络错误）。把人话直接给出来。
+        let hint = if host.contains("127.0.0.1")
+            || host.contains("localhost")
+            || host.contains("[::1]")
+            || host.contains("0.0.0.0")
+        {
+            "。本地地址拉取失败通常是插件服务未启动，请先到「扩展中心」启动对应插件后再试"
+        } else {
+            ""
+        };
+        return Err(format!("模型列表拉取失败：{}{}", detail, hint));
     };
 
     let body: serde_json::Value = r.json().await.map_err(|e| format!("解析失败: {}", e))?;

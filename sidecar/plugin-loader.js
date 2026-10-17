@@ -44,15 +44,17 @@ const pluginCache = new Map(); // key: pluginId, value: { manifest, adapter, plu
 
 // ── ctx: utilities injected into every adapter method call ──
 const adapterContext = {
+  // windowsHide：Windows 下 exec 会拉起 cmd.exe，不隐藏就会闪黑窗。
+  // 插件在部署/升级阶段会反复调用外部命令（curl、tar），每一声"闪一下"都很碍眼。
   commandExists: (name) => new Promise((resolve) => {
     const cmd = process.platform === 'win32' ? `where ${name}` : `which ${name}`;
-    exec(cmd, { timeout: 5000 }, (err) => resolve(!err));
+    exec(cmd, { timeout: 5000, windowsHide: true }, (err) => resolve(!err));
   }),
   fetch: globalThis.fetch,
   fs: fsPromises,
   path: pathMod,
   exec: (cmd, options = {}) => new Promise((resolve, reject) => {
-    const opts = { maxBuffer: 10 * 1024 * 1024, ...options };
+    const opts = { maxBuffer: 10 * 1024 * 1024, windowsHide: true, ...options };
     exec(cmd, opts, (error, stdout, stderr) => {
       if (error) reject(error); else resolve({ stdout, stderr });
     });

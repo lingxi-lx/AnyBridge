@@ -389,6 +389,18 @@
                     <label for="cb-edit-default-effort">默认档位 <span class="cb-edit-label-tip">请求档位不在白名单时自动回落到此档，留空则不指定</span></label>
                     <select id="cb-edit-default-effort"></select>
                   </div>
+                  <div id="cb-edit-buddy-thinking-extra" class="cb-edit-form-item" style="display:none;">
+                    <label style="margin-bottom:4px;">思考开关 <span class="cb-edit-label-tip">控制聊天界面是否提供「关闭思考」选项</span></label>
+                    <div class="cb-edit-caps">
+                      <label title="模型只有思考模式：聊天界面不显示「关闭思考」。需同时勾选上方「深度推理」才会生效"><input type="checkbox" id="cb-edit-only-reasoning"> 仅思考模型</label>
+                      <label title="取消勾选后聊天界面不显示「关闭思考」（写入 reasoning.canDisableThinking = false）"><input type="checkbox" id="cb-edit-allow-disable-thinking"> 允许关闭思考</label>
+                    </div>
+                    <label for="cb-edit-reasoning-summary" style="margin-top:8px;">思考摘要 <span class="cb-edit-label-tip">让上游返回思考摘要，官方内置模型统一为自动</span></label>
+                    <select id="cb-edit-reasoning-summary">
+                      <option value="">不指定</option>
+                      <option value="auto">自动</option>
+                    </select>
+                  </div>
                   <div id="cb-edit-reasoning-hint" class="zc-reasoning-hint"></div>
                 </div>
 

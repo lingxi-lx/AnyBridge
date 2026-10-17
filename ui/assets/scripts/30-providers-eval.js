@@ -291,8 +291,15 @@ function updateSlotVisionHint() {
 }
 
 
+/** 插件部署时自动登记的本地供应商（id 形如 plugin-<插件id>），与 CPA 同级内置待遇 */
+function isPluginLocalProvider(p) {
+  if (!p) return false;
+  const id = p.id || p.providerId || p.provider_id;
+  return typeof id === 'string' && id.startsWith('plugin-');
+}
+
 function isBuiltinProvider(p) {
-  return isLocalProxyProvider(p) || isCpaLocalProvider(p);
+  return isLocalProxyProvider(p) || isCpaLocalProvider(p) || isPluginLocalProvider(p);
 }
 
 /** 仅前端注入、不落盘的内置供应商（AnyBridge 本地代理） */
@@ -367,6 +374,7 @@ function isCpaLocalProxy(p) {
 function isOtherBuiltinProxy(p) {
   if (!p) return false;
   if (isAnyBridgeLocalProxy(p) || isCpaLocalProxy(p)) return false;
+  if (isPluginLocalProvider(p)) return true;
   if (p.isBuiltin === true || p.builtin === true || p.meta?.builtin === true || p.meta?.isBuiltin === true) return true;
   if (p.meta?.pluginProxy === true || p.isPluginProxy === true || p.meta?.isProxy === true || p.isProxy === true) return true;
   if (p.meta?.cpaLocal === true || p.meta?.localProxy === true) return true;
@@ -391,6 +399,9 @@ function builtinProviderBadgeHtml(p) {
     return '<span class="provider-builtin-badge">本地代理</span>';
   }
   if (isCpaLocalProvider(p)) {
+    return '<span class="provider-builtin-badge">本地代理</span>';
+  }
+  if (isPluginLocalProvider(p)) {
     return '<span class="provider-builtin-badge">本地代理</span>';
   }
   return '';

@@ -36,7 +36,7 @@
       "key": "port",
       "label": "监听端口",
       "type": "number",
-      "default": 8000,
+      "default": 8700,
       "required": true,
       "description": "服务监听端口",
       "hidden": false,
