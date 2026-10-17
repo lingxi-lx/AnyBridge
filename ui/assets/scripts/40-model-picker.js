@@ -909,6 +909,11 @@ function filterModelPanel() {
 
   const groups = groupModels(filtered);
 
+  // 计数徽标必须在所有分支都刷新：列表清空时若不更新，
+  // 上一次拉取成功的数字会残留在 DOM 里，让人误以为本次也拉到了。
+  const countEl = document.getElementById('modelPanelCount');
+  if (countEl) countEl.textContent = `${filtered.length} 个`;
+
   if (filtered.length === 0) {
     body.innerHTML = '<div class="model-panel-empty">暂无模型，请先拉取或自定义添加</div>';
     return;
@@ -957,10 +962,6 @@ function filterModelPanel() {
         </div>
       </div>`;
   }).join('');
-
-  // Update count
-  const countEl = document.getElementById('modelPanelCount');
-  if (countEl) countEl.textContent = `${filtered.length} 个`;
 }
 
 function toggleSelectGroup(groupName, selectAll) {
