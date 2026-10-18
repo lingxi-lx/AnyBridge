@@ -16,6 +16,66 @@ use std::time::Duration;
 
 use super::extensions::{self, DownloadProgress};
 
+/// 卸载时 adapter 会把凭证与运行状态备份到 `~/.anybridge/<pluginId>-backup-<时间戳>/`
+/// （见 adapter 的 prepareUninstall）。再次安装时把它们放回去 —— 卸载重装不该
+/// 让用户把账号重新登录一遍。
+///
+/// 只拷回安装目录里**还没有**的目录：已有的一律不动，绝不覆盖更新的数据。
+/// 返回一句可展示的说明（恢复了哪些目录、来自哪份备份）。
+pub(crate) fn restore_latest_backup(plugin_id: &str, install_path: &Path) -> Option<String> {
+    let backup_root = dirs::home_dir()?.join(".anybridge");
+    let prefix = format!("{}-backup-", plugin_id);
+
+    let mut candidates: Vec<PathBuf> = fs::read_dir(&backup_root)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+        .collect();
+    // 目录名末尾是 ISO 时间戳，字典序即时间序，最后一个就是最近一次卸载的备份
+    candidates.sort();
+    let latest = candidates.pop()?;
+
+    let mut restored = Vec::new();
+    for dir in ["auths", "data"] {
+        let from = latest.join(dir);
+        let to = install_path.join(dir);
+        if !from.is_dir() || to.exists() {
+            continue;
+        }
+        if copy_dir_recursive(&from, &to).is_ok() {
+            restored.push((*dir).to_string());
+        }
+    }
+
+    if restored.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "{}（来自 {}）",
+            restored.join("、"),
+            latest.display()
+        ))
+    }
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| format!("无法创建目录 {}：{}", to.display(), e))?;
+    for entry in fs::read_dir(from)
+        .map_err(|e| format!("无法读取备份目录 {}：{}", from.display(), e))?
+        .flatten()
+    {
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else if src.is_file() {
+            fs::copy(&src, &dst).map_err(|e| format!("无法复制 {}：{}", src.display(), e))?;
+        }
+    }
+    Ok(())
+}
+
 /// 插件在 plugin.json 的 `deploy.asset` 里声明的发布包规格。
 #[derive(Debug, Clone)]
 pub(crate) struct ReleaseAssetSpec {
@@ -347,3 +407,4 @@ fn extract_tar_gz(archive: &Path, target: &Path, strip: usize) -> Result<(), Str
     }
     Ok(())
 }
+

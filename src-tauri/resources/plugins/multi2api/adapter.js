@@ -171,7 +171,10 @@ export default {
     const configPath = ctx.path.join(installPath, CONFIG_NAME);
     await ctx.fs.writeFile(configPath, JSON.stringify(config, null, 2), 'utf-8');
     ctx.log('info', `配置文件已生成 ${configPath}`);
-    return { configPath };
+
+    // 把真正写进网关 config.json 的密钥回传给 AnyBridge：登记本地供应商时就以它为准，
+    // 而不是拿 AnyBridge 侧缓存的那一份 —— 两边只要出现偏差，拉取模型就会 401。
+    return { configPath, apiKey, adminToken };
   },
 
   // ═══════════════════════════════════════════════════════════════════════

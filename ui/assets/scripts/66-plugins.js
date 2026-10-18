@@ -1228,6 +1228,7 @@ function stepLabelFor(key) {
     'check-environment': '检测环境',
     'environment-ok': '环境就绪',
     download: '获取发布包',
+    restore: '恢复数据',
     deploy: '执行部署',
     config: '生成配置',
     'add-provider': '注册供应商',

@@ -902,6 +902,20 @@ pub async fn plugin_deploy(
             emit_status(&app, &status);
             return Err(e);
         }
+
+        // 卸载重装：把上次卸载前备份的凭证与运行状态放回去，账号不用重新登录
+        if let Some(restored) = plugin_asset::restore_latest_backup(&plugin_id, Path::new(&install_path))
+        {
+            emit_deploy_progress(
+                &app,
+                &plugin_id,
+                &strategy,
+                "restore",
+                "done",
+                &format!("已恢复上次卸载前的数据：{}", restored),
+                None,
+            );
+        }
     }
 
     let total = candidates.len();
@@ -928,6 +942,15 @@ pub async fn plugin_deploy(
                     if let Some(cv) = config_values.as_object() {
                         for (k, v) in cv {
                             obj.insert(k.clone(), v.clone());
+                        }
+                    }
+                    // 以网关实际写入的凭证为准回写缓存。
+                    // adapter 可以在 generateConfig 的返回值里回传它真正写进
+                    // 插件配置文件的密钥；只要本地缓存与网关用的不是同一把，
+                    // 拉取模型列表就会 401，而界面上只看得到「拉取不到模型」。
+                    for key in ["apiKey", "adminToken"] {
+                        if let Some(v) = result_obj.get(key).and_then(|v| v.as_str()) {
+                            obj.insert((*key).to_string(), serde_json::json!(v));
                         }
                     }
                     obj.insert("installPath".to_string(), serde_json::json!(install_path));
