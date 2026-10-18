@@ -292,6 +292,38 @@ fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// 获取指定 PID 的可执行文件路径。进程已退出、无权限或查询失败时返回 None。
+#[cfg(target_os = "windows")]
+fn process_exe_path(pid: u32) -> Option<String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!("(Get-Process -Id {} -ErrorAction SilentlyContinue).Path", pid),
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() {
+        None
+    } else {
+        Some(path)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn process_exe_path(pid: u32) -> Option<String> {
+    let path = std::fs::read_link(format!("/proc/{}/exe", pid)).ok()?;
+    Some(path.to_string_lossy().to_string())
+}
+
 #[cfg(not(target_os = "windows"))]
 fn is_pid_alive(pid: u32) -> bool {
     // signal 0 performs error checking without actually sending a signal
@@ -1085,7 +1117,31 @@ pub async fn plugin_start(
                 return Err(format!("插件已在运行中 (PID {}, 端口 {})", pid, port));
             }
         }
-        return Err(format!("端口 {} 已被其他程序占用，请在配置中更换端口", port));
+
+        // status.json 里没有 pid 或 pid 已死，但端口仍被占 —— 典型场景是
+        // AnyBridge 上次异常退出没来得及杀子进程，或服务曾在 AnyBridge 之外被启动。
+        // 这种「游离进程」如果不处理，UI 显示已停止、点启动永远撞端口，用户只能去
+        // 任务管理器里找。占用者若是本插件自己安装目录下的服务进程，就接管：
+        // 杀掉它再正常启动；是别的程序占端口则维持原有报错，绝不越界乱杀。
+        if let Some(pid) = extensions::pid_listening_on_port(port) {
+            if let Some(exe) = process_exe_path(pid) {
+                let exe_norm = exe.to_ascii_lowercase().replace('\\', "/");
+                let inst_norm = install_path.to_ascii_lowercase().replace('\\', "/");
+                if exe_norm.starts_with(inst_norm.trim_end_matches('/')) {
+                    kill_pid(pid);
+                    for _ in 0..20 {
+                        if !is_port_in_use(port) {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+
+        if is_port_in_use(port) {
+            return Err(format!("端口 {} 已被其他程序占用，请在配置中更换端口", port));
+        }
     }
 
     // Get start command from adapter
