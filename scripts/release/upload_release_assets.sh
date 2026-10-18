@@ -82,15 +82,19 @@ delete_by_name() {
   done
 }
 
-for attempt in $(seq 1 8); do
+# 退避递增而不是固定间隔：release 刚 create 时 uploads 端点会有一段「查得到 API、
+# 上传却 404」的同步窗口（v0.5.37 发布到公开仓库时就是卡在这，固定 15 秒重试
+# 8 次都撞同一个 404）。越等越久，让端点有机会收敛。
+for attempt in $(seq 1 10); do
   delete_by_name
   if gh release upload "$TAG" --repo "$REPO" "${FILES[@]}"; then
     echo "已上传 ${#FILES[@]} 个资产到 $REPO:$TAG（第 $attempt 次尝试）"
     exit 0
   fi
-  echo "::warning::$REPO:$TAG 资产上传失败（第 $attempt/8 次），15 秒后重试"
-  sleep 15
+  local_wait=$((attempt * 15))
+  echo "::warning::$REPO:$TAG 资产上传失败（第 $attempt/10 次），${local_wait} 秒后重试"
+  sleep "$local_wait"
 done
 
-echo "::error::$REPO:$TAG 资产上传重试 8 次仍失败"
+echo "::error::$REPO:$TAG 资产上传重试 10 次仍失败"
 exit 1
