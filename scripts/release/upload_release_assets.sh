@@ -67,48 +67,30 @@ fi
 # 元数据，用户自动更新静默失效，只能手动补传。
 #
 # 这里改为「按当前列表精确删除同名资产 → 上传」，删除与上传都各自容错，状态可收敛。
-asset_exists() {
-  local base="$1" names
-  names="$(gh release view "$TAG" --repo "$REPO" --json assets --jq -r '.assets[].name' 2>/dev/null)"
-  [ -z "$names" ] && return 1
-  printf '%s\n' "$names" | grep -Fxq "$base"
-}
-
-delete_existing_assets() {
-  local base waited
+# 无条件按名字删一遍：资产列表与 uploads 端点之间存在最终一致性差异，
+# 「列表里查不到」并不代表「上传时不存在」。v0.5.37 就是栽在这里 —— 脚本先查列表、
+# 查不到就跳过删除，紧接着上传却报 422 already exists，重试 6 次全撞同一场竞态。
+# 因此不能以列表为准，只能以「实际上传结果」为准：先删（删不到也无妨）再传，
+# 失败就再删再传，直到状态收敛。
+delete_by_name() {
+  local base
   for f in "${FILES[@]}"; do
     base="$(basename "$f")"
-    asset_exists "$base" || continue
-
-    echo "删除已存在的同名资产: $base"
-    gh release delete-asset "$TAG" --repo "$REPO" "$base" --yes 2>/dev/null || \
-      echo "::warning::删除 $base 失败（可能已被并发删除）"
-
-    # 删除是异步收敛的：API 列表可能已删、上传端点仍认为存在（422 already exists），
-    # 也可能反过来（删除请求落到已失效的资产 id 而 404）。两者都会让「删了再传」
-    # 变成死循环（v0.5.30 / v0.5.34 就是这么失败的）。所以必须等到资产名从 API
-    # 列表里真正消失再上传；等不到就把现状说出来，交由上传重试那一层兜底。
-    waited=0
-    while asset_exists "$base"; do
-      if [ "$waited" -ge 60 ]; then
-        echo "::warning::$base 删除后 60s 仍在资产列表中可见，继续尝试上传"
-        break
-      fi
-      sleep 3
-      waited=$((waited + 3))
-    done
+    if gh release delete-asset "$TAG" --repo "$REPO" "$base" --yes 2>/dev/null; then
+      echo "已删除同名资产: $base"
+    fi
   done
 }
 
-for attempt in $(seq 1 6); do
-  delete_existing_assets
+for attempt in $(seq 1 8); do
+  delete_by_name
   if gh release upload "$TAG" --repo "$REPO" "${FILES[@]}"; then
     echo "已上传 ${#FILES[@]} 个资产到 $REPO:$TAG（第 $attempt 次尝试）"
     exit 0
   fi
-  echo "::warning::$REPO:$TAG 资产上传失败（第 $attempt/6 次），12 秒后重试"
-  sleep 12
+  echo "::warning::$REPO:$TAG 资产上传失败（第 $attempt/8 次），15 秒后重试"
+  sleep 15
 done
 
-echo "::error::$REPO:$TAG 资产上传重试 6 次仍失败"
+echo "::error::$REPO:$TAG 资产上传重试 8 次仍失败"
 exit 1
