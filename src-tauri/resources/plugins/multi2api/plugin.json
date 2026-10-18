@@ -46,9 +46,9 @@
       "key": "apiKey",
       "label": "API 密钥",
       "type": "password",
-      "default": "",
+      "default": "anybridge-local",
       "required": true,
-      "description": "OpenAI 兼容接口的 Bearer 密钥。填写到 AnyBridge 供应商的 API Key 一栏",
+      "description": "OpenAI 兼容接口的 Bearer 密钥，留空则用固定值 anybridge-local（网关只监听 127.0.0.1，本机之外访问不到）。安装后会自动登记到供应商，两者始终一致",
       "hidden": false,
       "generate": "base64-32",
       "immutable": false
@@ -57,9 +57,9 @@
       "key": "adminToken",
       "label": "管理令牌",
       "type": "password",
-      "default": "",
+      "default": "anybridge-admin",
       "required": true,
-      "description": "管理控制台与 /admin/* 的门禁令牌，独立于 API 密钥（本机访问免令牌）",
+      "description": "管理控制台与 /admin/* 的门禁令牌，留空则用固定值 anybridge-admin，独立于 API 密钥（本机访问免令牌）",
       "hidden": true,
       "generate": "base64-32",
       "immutable": false

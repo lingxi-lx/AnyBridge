@@ -21,6 +21,18 @@ const CONFIG_NAME = 'config.json';
 const MIN_DISK_MB = 120; // 与 plugin.json 的 deploy.minDiskMB 保持一致
 const NETWORK_TIMEOUT_MS = 30000;
 
+// 固定凭证（不再每次随机生成）。
+//
+// 为什么写死：网关只监听 127.0.0.1，外部访问不到，这把钥匙的作用是「占位 +
+// 区分调用方」，不承担真实鉴权。而随机生成会埋一个真实的坑 —— 每次安装或
+// 「重新生成配置文件」都会换一把新钥匙，AnyBridge 侧登记的供应商却可能还留着
+// 旧的那把，于是拉取模型列表时网关返回 401，界面上只能看到「拉取不到模型」，
+// 看不出是钥匙过期还是服务没起。固定值让「重装 / 重配 / 换机器」都不会失配。
+//
+// 用户在配置表单里填了自己的值则以其为准（尊重显式输入）。
+const DEFAULT_API_KEY = 'anybridge-local';
+const DEFAULT_ADMIN_TOKEN = 'anybridge-admin';
+
 function binFileName() {
   return process.platform === 'win32' ? `${BINARY}.exe` : BINARY;
 }
@@ -130,8 +142,8 @@ export default {
     await requireBinary(ctx, installPath);
 
     const port = Number(configValues.port) || DEFAULT_PORT;
-    const apiKey = configValues.apiKey || ctx.generateBase64(32);
-    const adminToken = configValues.adminToken || ctx.generateBase64(32);
+    const apiKey = configValues.apiKey || DEFAULT_API_KEY;
+    const adminToken = configValues.adminToken || DEFAULT_ADMIN_TOKEN;
 
     // 保持与上游 config.example.json 的部署形态一致；
     // max_body_mb 上调到 32：编码 Agent 的长上下文请求体容易超过默认 8MB 触发 413。

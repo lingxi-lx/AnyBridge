@@ -2295,16 +2295,22 @@ pub async fn fetch_models(args: FetchModelsArgs) -> Result<FetchModelsResult, St
         } else {
             attempts.join("；")
         };
-        // 本机网关拉不到时，最常见原因是插件服务没启动（端口无人监听，
-        // 代理层会把连接失败转成 502/网络错误）。把人话直接给出来。
-        let hint = if host.contains("127.0.0.1")
+        // 本机网关拉不到时，把最常见也最容易误判的两个原因直接说清楚：
+        // 服务没起（端口无人监听，代理层把连接失败转成 502/网络错误）、
+        // 或者本地供应商里填的密钥与插件网关当前用的不是同一把（401）。
+        let is_local = host.contains("127.0.0.1")
             || host.contains("localhost")
             || host.contains("[::1]")
-            || host.contains("0.0.0.0")
+            || host.contains("0.0.0.0");
+        let hint = if !is_local {
+            String::new()
+        } else if attempts
+            .iter()
+            .any(|a| a.contains("401") || a.to_ascii_lowercase().contains("invalid_api_key"))
         {
-            "。本地地址拉取失败通常是插件服务未启动，请先到「扩展中心」启动对应插件后再试"
+            "。网关返回 401：本地供应商里填的 API 密钥与插件网关当前使用的不是同一把，请到「扩展中心」重新生成插件配置并保存供应商".to_string()
         } else {
-            ""
+            "。本地地址拉取失败通常是插件服务未启动，请先到「扩展中心」启动对应插件后再试".to_string()
         };
         return Err(format!("模型列表拉取失败：{}{}", detail, hint));
     };
@@ -2370,5 +2376,28 @@ mod tests {
         assert!(!is_json_api_error("   "));
         assert!(!is_json_api_error("<html><body><h1>403 Forbidden</h1></body></html>"));
         assert!(!is_json_api_error("Forbidden"));
+    }
+}
+
+#[cfg(test)]
+mod fetch_models_probe {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore]
+    async fn probe_multi2api_models() {
+        let key = std::env::var("PROBE_KEY").unwrap_or_default();
+        for fmt in ["anthropic", "openai", "gemini"] {
+            let args = FetchModelsArgs {
+                host: "http://127.0.0.1:7863".into(),
+                api_key: key.clone(),
+                path: Some("/v1".into()),
+                api_format: Some(fmt.into()),
+            };
+            match fetch_models(args).await {
+                Ok(r) => println!("[{fmt}] ok, {} models, first={:?}", r.models.len(), r.models.first()),
+                Err(e) => println!("[{fmt}] ERR: {}", e),
+            }
+        }
     }
 }
