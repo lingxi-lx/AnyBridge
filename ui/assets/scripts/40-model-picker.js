@@ -1731,6 +1731,16 @@ async function fetchModelsForEditor(options = {}) {
     activeModelsList = Array.from(new Set([...selectedModels, modelVal].filter(Boolean)));
     modelGroupStates = {};
     filterModelPanel();
+    // 失败原因直接写在模型面板上 —— 之前只进扩展中心日志，用户在编辑页
+    // 只看到「暂无模型」，根本不知道是服务没起还是密钥不对。
+    const failBody = document.getElementById('modelPanelBody');
+    if (failBody) {
+      const line = document.createElement('div');
+      line.className = 'model-panel-empty';
+      line.style.color = 'var(--danger, #dc2626)';
+      line.textContent = `拉取失败：${String(e)}`;
+      failBody.replaceChildren(line);
+    }
   } finally {
     if (btn) {
       btn.dataset.loading = '0';
