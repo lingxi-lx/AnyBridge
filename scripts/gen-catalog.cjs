@@ -57,12 +57,12 @@ function tokenMatches(id, token) {
 // 按模型名推荐上下文（读 model-context-presets.json，边界匹配）
 function recommendContext(slug) {
   const presetsPath = path.join(__dirname, '../ui/assets/model-context-presets.json');
-  let presets = { defaults: { maxInputTokens: 128000 }, models: [], patterns: [] };
+  let presets = { defaults: { maxInputTokens: 256000 }, models: [], patterns: [] };
   try {
     presets = JSON.parse(fs.readFileSync(presetsPath, 'utf8'));
   } catch {}
   const id = String(slug || '').toLowerCase().replace(/\s+/g, '-');
-  const fallback = Number(presets?.defaults?.maxInputTokens) || 128000;
+  const fallback = Number(presets?.defaults?.maxInputTokens) || 256000;
   if (!id) return fallback;
 
   let best = null;
@@ -107,6 +107,9 @@ const customModels = [
   { slug: 'qwen3.8-flash', display_name: 'qwen3.8-flash' },
   { slug: 'minimax-m3.1', display_name: 'minimax-m3.1' },
   { slug: 'minimax-m3', display_name: 'minimax-m3' },
+  { slug: 'step-5-preview', display_name: 'step-5-preview' },
+  { slug: 'claude-haiku-5-5', display_name: 'claude-haiku-5.5' },
+  { slug: 'mistral-large-4', display_name: 'mistral-large-4' },
   { slug: 'deepseek-v4.1-flash', display_name: 'deepseek-v4.1-flash' },
   { slug: 'deepseek-v4-pro', display_name: 'deepseek-v4-pro' },
   { slug: 'deepseek-v4-flash', display_name: 'deepseek-v4-flash' },

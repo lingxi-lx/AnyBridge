@@ -58,6 +58,9 @@
 //   - mimo-v2-6-flash
 //   - mimo-v2-6-pro
 //   - glm-flash-latest
+//   - step-5-preview
+//   - claude-haiku-5-5
+//   - mistral-large-4
 export const WINDSURF_CATALOG = [
   {
     "label": "Claude 3.5 Haiku",
@@ -2448,6 +2451,30 @@ export const WINDSURF_CATALOG = [
     "modelUid": "glm-flash-latest",
     "apiId": "glm-flash-latest",
     "contextWindow": 1310720,
+    "supportsImages": true,
+    "noApiIdHint": null
+  },
+  {
+    "label": "Step 5 Preview",
+    "modelUid": "step-5-preview",
+    "apiId": "step-5-preview",
+    "contextWindow": 1048576,
+    "supportsImages": true,
+    "noApiIdHint": null
+  },
+  {
+    "label": "Claude Haiku 5.5",
+    "modelUid": "claude-haiku-5-5",
+    "apiId": "claude-haiku-5.5",
+    "contextWindow": 1000000,
+    "supportsImages": true,
+    "noApiIdHint": null
+  },
+  {
+    "label": "Mistral Large 4",
+    "modelUid": "mistral-large-4",
+    "apiId": "mistral-large-4",
+    "contextWindow": 1048576,
     "supportsImages": true,
     "noApiIdHint": null
   }

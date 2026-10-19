@@ -5647,10 +5647,10 @@ struct ModelContextDefaults {
 }
 
 fn default_max_input() -> u64 {
-    128_000
+    256_000
 }
 fn default_max_output() -> u64 {
-    8_192
+    16_384
 }
 
 impl Default for ModelContextDefaults {
@@ -8308,6 +8308,46 @@ mod tests {
     fn models_json_obj(raw: &str) -> Map<String, Value> {
         let value: Value = serde_json::from_str(raw).unwrap();
         value.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn test_model_context_presets_resolution() {
+        assert_eq!(
+            resolve_model_context_preset("step-5-preview"),
+            (1_048_576, 131_072)
+        );
+        assert_eq!(
+            resolve_model_context_preset("step-5"),
+            (1_048_576, 131_072)
+        );
+        assert_eq!(
+            resolve_model_context_preset("step-3.7-flash"),
+            (262_144, 65_536)
+        );
+        assert_eq!(
+            resolve_model_context_preset("claude-haiku-5-5"),
+            (1_000_000, 128_000)
+        );
+        assert_eq!(
+            resolve_model_context_preset("gemini-4-argon"),
+            (1_048_576, 65_536)
+        );
+        assert_eq!(
+            resolve_model_context_preset("mistral-large-4"),
+            (1_048_576, 131_072)
+        );
+        assert_eq!(
+            resolve_model_context_preset("nemotron-3.5-super-vl"),
+            (1_048_576, 65_536)
+        );
+        assert_eq!(
+            resolve_model_context_preset("deepseek-v4.1-flash-1017"),
+            (1_048_576, 384_000)
+        );
+        assert_eq!(
+            resolve_model_context_preset("unknown-custom-model-xyz"),
+            (256_000, 16_384)
+        );
     }
 
     /// Codex 0.146+ 对 model catalog 做严格 schema 校验：任何条目缺

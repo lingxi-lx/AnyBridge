@@ -1,12 +1,148 @@
 {
-  "version": 6,
-  "updatedAt": "2026-10-03",
-  "source": "综合官方文档与公开横评（Anthropic / OpenAI / Google / 智谱 / DeepSeek / Kimi / Qwen / xAI / MiniMax 等）",
+  "version": 7,
+  "updatedAt": "2026-10-19",
+  "source": "综合官方文档与公开横评（Anthropic / OpenAI / Google / 阶跃星辰 / 智谱 / DeepSeek / Kimi / Qwen / xAI / MiniMax / Mistral 等）",
   "defaults": {
-    "maxInputTokens": 128000,
-    "maxOutputTokens": 8192
+    "maxInputTokens": 256000,
+    "maxOutputTokens": 16384
   },
   "models": [
+    {
+      "id": "step-5-preview",
+      "match": [
+        "step-5-preview",
+        "step-5",
+        "step5-preview",
+        "step5",
+        "step-5-mini",
+        "step5-mini"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 131072,
+      "vendor": "stepfun",
+      "note": "阶跃星辰 Step 5 Preview / Step 5 旗舰 MoE 1M 上下文 / 128K 输出"
+    },
+    {
+      "id": "step-3.7-flash",
+      "match": [
+        "step-3.7-flash",
+        "step-3-7-flash",
+        "step-3.7",
+        "step-3-7",
+        "step-3.5-flash",
+        "step-3-flash"
+      ],
+      "maxInputTokens": 262144,
+      "maxOutputTokens": 65536,
+      "vendor": "stepfun",
+      "note": "阶跃星辰 Step 3.7 Flash 256K 上下文 / 64K 输出"
+    },
+    {
+      "id": "step-2",
+      "match": [
+        "step-2",
+        "step-2-16k",
+        "step-2-mini",
+        "step-2-pro",
+        "step-2-128k",
+        "step-2-256k"
+      ],
+      "maxInputTokens": 262144,
+      "maxOutputTokens": 32768,
+      "vendor": "stepfun",
+      "note": "阶跃星辰 Step 2 系列 256K 上下文"
+    },
+    {
+      "id": "step-1",
+      "match": [
+        "step-1",
+        "step-1-8k",
+        "step-1-32k",
+        "step-1-128k",
+        "step-1-256k",
+        "step-1v",
+        "step-1.5v",
+        "step-1o"
+      ],
+      "maxInputTokens": 262144,
+      "maxOutputTokens": 16384,
+      "vendor": "stepfun",
+      "note": "阶跃星辰 Step 1 / 1.5 系列"
+    },
+    {
+      "id": "claude-haiku-5-5",
+      "match": [
+        "claude-haiku-5-5",
+        "claude-haiku-5.5",
+        "haiku-5-5",
+        "haiku-5.5",
+        "claude-5-5-haiku",
+        "claude-5.5-haiku"
+      ],
+      "maxInputTokens": 1000000,
+      "maxOutputTokens": 128000,
+      "vendor": "anthropic",
+      "note": "Claude Haiku 5.5 1M 上下文 / 128K 输出"
+    },
+    {
+      "id": "gemini-4",
+      "match": [
+        "gemini-4",
+        "gemini-4.0",
+        "gemini-4-argon",
+        "gemini-4-pro",
+        "gemini-4-flash",
+        "gemini4"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 65536,
+      "vendor": "google",
+      "note": "Gemini 4 / Argon 系列 1M 上下文"
+    },
+    {
+      "id": "mistral-large-4",
+      "match": [
+        "mistral-large-4",
+        "mistral-large-4-0",
+        "mistral-large-4.0",
+        "mistral-large-2509",
+        "mistral-large-2510",
+        "mistral-large"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 131072,
+      "vendor": "mistral",
+      "note": "Mistral Large 4 1M 上下文 / 128K 输出"
+    },
+    {
+      "id": "nemotron-3.5",
+      "match": [
+        "nemotron-3.5",
+        "nemotron-3.5-super-vl",
+        "nemotron-3-ultra",
+        "nemotron-3.5-lightning",
+        "nemotron-3.5-super"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 65536,
+      "vendor": "nvidia",
+      "note": "NVIDIA Nemotron 3.5 系列 1M 上下文"
+    },
+    {
+      "id": "qwen3-coder",
+      "match": [
+        "qwen3-coder",
+        "qwen3.8-coder",
+        "qwen3-8-coder",
+        "qwen-coder",
+        "qwen2.5-coder",
+        "qwen2-5-coder"
+      ],
+      "maxInputTokens": 262144,
+      "maxOutputTokens": 65536,
+      "vendor": "alibaba",
+      "note": "Qwen Coder 系列原生 256K / 64K 输出"
+    },
     {
       "id": "ling-3.0",
       "match": [
@@ -90,7 +226,9 @@
         "qwen3-8-27b",
         "qwen3.8-2.4t-a95b",
         "qwen3-8-2-4t-a95b",
-        "qwen3-8-flash-high"
+        "qwen3-8-flash-high",
+        "qwen3.8-omni-flash",
+        "qwen3-8-omni-flash"
       ],
       "maxInputTokens": 1000000,
       "maxOutputTokens": 131072,
@@ -104,7 +242,11 @@
         "qwen3-8-max",
         "qwen3.8-max-preview",
         "qwen3-8-max-preview",
-        "qwen3-8-max-high"
+        "qwen3-8-max-high",
+        "qwen3.8-max-prime",
+        "qwen3-8-max-prime",
+        "qwen3.8-max-0902",
+        "qwen3-8-max-0902"
       ],
       "maxInputTokens": 1000000,
       "maxOutputTokens": 128000,
@@ -119,7 +261,9 @@
         "deepseek-v4.1",
         "deepseek-v4-1",
         "deepseek-flash",
-        "deepseek-v4-1-flash-high"
+        "deepseek-v4-1-flash-high",
+        "deepseek-v4.1-flash-1017",
+        "deepseek-v4-1-flash-1017"
       ],
       "maxInputTokens": 1048576,
       "maxOutputTokens": 384000,
@@ -189,7 +333,9 @@
       "match": [
         "gpt-6-luna",
         "gpt-6.0-luna",
-        "gpt6-luna"
+        "gpt6-luna",
+        "gpt-6-luna-pro",
+        "gpt6-luna-pro"
       ],
       "maxInputTokens": 1050000,
       "maxOutputTokens": 128000,
@@ -207,7 +353,9 @@
         "gpt-6-1-sol-high",
         "gpt-6-1-sol-medium",
         "gpt-6-1-sol-xhigh",
-        "gpt-6-1-sol-max"
+        "gpt-6-1-sol-max",
+        "gpt-6.1-sol-pro",
+        "gpt-6-1-sol-pro"
       ],
       "maxInputTokens": 1050000,
       "maxOutputTokens": 128000,
@@ -414,7 +562,8 @@
         "astra",
         "gpt-6-astra-pro",
         "gpt-6-sol",
-        "gpt-6.0-sol"
+        "gpt-6.0-sol",
+        "gpt-6-sol-pro"
       ],
       "maxInputTokens": 1050000,
       "maxOutputTokens": 128000,
@@ -659,7 +808,11 @@
         "gemini3-pro",
         "gemini-3.1-pro",
         "gemini-3.1-pro-low",
-        "gemini-pro-agent"
+        "gemini-pro-agent",
+        "gemini-3.8-pro",
+        "gemini-3.8pro",
+        "gemini-3.7-pro",
+        "gemini-3.7pro"
       ],
       "maxInputTokens": 1000000,
       "maxOutputTokens": 65536,
@@ -749,7 +902,11 @@
         "glm_5_3",
         "glm-5-3-low",
         "glm-5-3-high",
-        "glm-5-3-max"
+        "glm-5-3-max",
+        "glm-5.3-prime",
+        "glm-5-3-prime",
+        "glm-5.3-flashx",
+        "glm-5-3-flashx"
       ],
       "maxInputTokens": 1000000,
       "maxOutputTokens": 128000,
@@ -1189,6 +1346,44 @@
       "note": "GPT-6 系默认 1.05M"
     },
     {
+      "id": "step-5-family",
+      "includesAny": [
+        "step-5",
+        "step5"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 131072,
+      "note": "阶跃星辰 Step 5 系列 1M 上下文"
+    },
+    {
+      "id": "gemini-4-family",
+      "includesAny": [
+        "gemini-4",
+        "gemini4"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 65536,
+      "note": "Gemini 4 系列 1M 上下文"
+    },
+    {
+      "id": "mistral-large-family",
+      "includesAny": [
+        "mistral-large"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 131072,
+      "note": "Mistral Large 系列 1M 上下文"
+    },
+    {
+      "id": "nemotron-family",
+      "includesAny": [
+        "nemotron"
+      ],
+      "maxInputTokens": 1048576,
+      "maxOutputTokens": 65536,
+      "note": "NVIDIA Nemotron 系列 1M 上下文"
+    },
+    {
       "id": "marker-1m",
       "includesAny": [
         "1m",
@@ -1490,6 +1685,27 @@
       "maxInputTokens": 256000,
       "maxOutputTokens": 16384,
       "note": "豆包 / Seed 256K（不用裸 seed，避免误伤）"
+    },
+    {
+      "id": "stepfun-family",
+      "includesAny": [
+        "stepfun",
+        "step"
+      ],
+      "maxInputTokens": 256000,
+      "maxOutputTokens": 32768,
+      "note": "阶跃星辰 Step 系列默认 256K"
+    },
+    {
+      "id": "mistral-family",
+      "includesAny": [
+        "mistral",
+        "mixtral",
+        "codestral"
+      ],
+      "maxInputTokens": 128000,
+      "maxOutputTokens": 16384,
+      "note": "Mistral / Codestral 默认 128K"
     },
     {
       "id": "yi-family",

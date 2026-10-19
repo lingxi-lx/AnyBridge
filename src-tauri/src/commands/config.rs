@@ -2256,11 +2256,19 @@ pub async fn fetch_models(args: FetchModelsArgs) -> Result<FetchModelsResult, St
 
     let mut resp = None;
     let mut attempts = Vec::new();
+    eprintln!(
+        "[fetch_models] host={} fmt={} key_len={} paths={:?}",
+        host,
+        fmt,
+        args.api_key.len(),
+        model_paths
+    );
     for path in model_paths {
         let url = format!("{}{}", host, path);
         let req = auth(client.get(&url).header("Accept", "application/json"));
         match req.send().await {
             Ok(r) if r.status().is_success() => {
+                eprintln!("[fetch_models] {} -> HTTP {} (成功)", path, r.status());
                 resp = Some(r);
                 break;
             }
@@ -2312,6 +2320,7 @@ pub async fn fetch_models(args: FetchModelsArgs) -> Result<FetchModelsResult, St
         } else {
             "。本地地址拉取失败通常是插件服务未启动，请先到「扩展中心」启动对应插件后再试".to_string()
         };
+        eprintln!("[fetch_models] 全部失败: {}", detail);
         return Err(format!("模型列表拉取失败：{}{}", detail, hint));
     };
 

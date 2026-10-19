@@ -6209,10 +6209,10 @@ function grokConfigProviderById(id) {
   return (providerStore.grokConfigs || []).find(p => p && p.id === id) || null;
 }
 
-/** 按模型推荐上下文窗口；拿不到推荐值时退回 128000（Grok 省略该字段会按 200000 处理） */
+/** 按模型推荐上下文窗口；拿不到推荐值时退回 256000（Grok 省略该字段会按 200000 处理） */
 function grokRecommendContextWindow(modelId) {
   const value = Number(cbRecommendContextWindow(modelId));
-  return Number.isFinite(value) && value > 0 ? value : 128000;
+  return Number.isFinite(value) && value > 0 ? value : 256000;
 }
 
 function grokConfigSourceProviders() {
@@ -10453,7 +10453,7 @@ function cbRecommendContextWindow(modelId) {
   if (typeof globalThis.recommendContextWindow === 'function') {
     return globalThis.recommendContextWindow(modelId);
   }
-  return 128000;
+  return 256000;
 }
 
 /** 按模型 ID 推断推荐最大输出 token。优先读 model-context-presets.json。 */
@@ -10461,19 +10461,19 @@ function cbRecommendMaxOutputTokens(modelId) {
   if (typeof globalThis.recommendMaxOutputTokens === 'function') {
     return globalThis.recommendMaxOutputTokens(modelId);
   }
-  return 8192;
+  return 16384;
 }
 
-/** 是否为历史遗留的默认 128K（可被推荐值覆盖） */
+/** 是否为历史遗留的默认 128K 或 256K（可被更高推荐值覆盖） */
 function cbIsLegacyDefaultContext(value) {
   const n = Number(value);
-  return Number.isFinite(n) && n === 128000;
+  return Number.isFinite(n) && (n === 128000 || n === 256000);
 }
 
 /**
  * 规范化模型上下文：缺失时填推荐值；
- * 若仍是历史默认 128K 且推荐值更大，则升级到推荐值。
- * 用户手动改成非 128K 的值会保留。
+ * 若仍是历史默认值且推荐值更大，则升级到推荐值。
+ * 用户手动改成的其他非默认值会保留。
  */
 function cbNormalizeModelContext(model) {
   if (!model || typeof model !== 'object') return model;
@@ -10486,9 +10486,9 @@ function cbNormalizeModelContext(model) {
     if (model.maxOutputTokens == null) model.maxOutputTokens = recommendedOut;
     return model;
   }
-  if (cbIsLegacyDefaultContext(current) && recommended > 128000) {
+  if (cbIsLegacyDefaultContext(current) && recommended > Number(current)) {
     model.maxInputTokens = recommended;
-    if (model.maxOutputTokens == null || Number(model.maxOutputTokens) === 8192) {
+    if (model.maxOutputTokens == null || Number(model.maxOutputTokens) === 8192 || Number(model.maxOutputTokens) === 16384) {
       model.maxOutputTokens = recommendedOut;
     }
   }
@@ -10610,7 +10610,7 @@ function cbApplyProviderModelSelection(prefix, provider, checkSelector, platform
       if (existing) {
         if (existing.maxInputTokens != null) {
           const rec = cbRecommendContextWindow(modelId);
-          if (cbIsLegacyDefaultContext(existing.maxInputTokens) && rec > 128000) {
+          if (cbIsLegacyDefaultContext(existing.maxInputTokens) && rec > Number(existing.maxInputTokens)) {
             built.maxInputTokens = rec;
           } else {
             built.maxInputTokens = existing.maxInputTokens;

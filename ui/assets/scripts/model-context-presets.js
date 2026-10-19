@@ -15,7 +15,7 @@ const PRESETS = await fetch(new URL('../model-context-presets.json', import.meta
     console.warn('[model-context-presets] 加载失败，使用内置默认值', err);
     return {
       version: 0,
-      defaults: { maxInputTokens: 128000, maxOutputTokens: 8192 },
+      defaults: { maxInputTokens: 256000, maxOutputTokens: 16384 },
       models: [],
       patterns: [],
     };
@@ -31,8 +31,8 @@ function normalizeModelId(modelId) {
 function defaultsOf() {
   const d = PRESETS?.defaults || {};
   return {
-    maxInputTokens: Number(d.maxInputTokens) || 128000,
-    maxOutputTokens: Number(d.maxOutputTokens) || 8192,
+    maxInputTokens: Number(d.maxInputTokens) || 256000,
+    maxOutputTokens: Number(d.maxOutputTokens) || 16384,
   };
 }
 
